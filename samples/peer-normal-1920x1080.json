@@ -1,0 +1,26 @@
+{
+  "tool": "ResProbe",
+  "version": "1.0.0",
+  "generatedUtc": "2026-10-08T06:30:00.000Z",
+  "mode": "snapshot",
+  "hostName": "REMOTE-CLIENT",
+  "userName": "Administrator",
+  "remoteSession": false,
+  "sessionId": 1,
+  "protocolType": "Console",
+  "timeUtc": "2026-10-08T06:30:00.000Z",
+  "primaryMode": "1920x1080",
+  "primaryGdiDevice": "\\\\.\\DISPLAY1",
+  "degraded": false,
+  "activeTargets": [
+    {
+      "gdiDeviceName": "\\\\.\\DISPLAY1",
+      "mode": "1920x1080",
+      "outputTechnology": "HDMI",
+      "active": true,
+      "primary": true,
+      "edidPresent": true,
+      "monitorName": "REMOTE-VIEW"
+    }
+  ]
+}
