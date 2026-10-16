@@ -13,7 +13,6 @@ build/
 *.d
 # 只按名字忽略本项目的可执行产物；不要用 *.exe ——
 # driver/usbmmidd_v2/deviceinstaller64.exe 是离线部署依赖，必须入库。
-resprobe.exe
 resprobe-tests.exe
 
 # ---- 运行时输出（日志 / JSON 报告 / 证据）----------------------------------
