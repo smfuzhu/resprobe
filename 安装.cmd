@@ -174,7 +174,15 @@ if "!RC!"=="%RP_NO_VDISPLAY%" (
     "%RP_DRV%\deviceinstaller64.exe" enableidd 1
     powershell -NoProfile -Command "Start-Sleep -Seconds 6" >nul 2>&1
 ) else (
-    echo        virtual display already available ^(ensure=!RC!^), not activating again.
+    if "!RC!"=="0" (
+        echo        virtual display already available ^(ensure=0^), not activating again.
+    ) else (
+        if "!RC!"=="%RP_NOT_READY%" (
+            echo        virtual display present, topology not applied yet ^(ensure=!RC!^); step 7 will retry.
+        ) else (
+            echo        [WARN] ensure returned !RC! ^(expected 0/20/21^), skipping activation to stay idempotent.
+        )
+    )
 )
 
 rem --- 7. apply topology -----------------------------------------------------

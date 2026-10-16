@@ -385,6 +385,7 @@ int RunPaths(Report& r) {
     std::vector<DisplayTarget> all =
         EnumerateDisplays(r.opt.referenceWidth, r.opt.referenceHeight, &diag, &totalPaths, true);
 
+    r.session = QuerySessionInfo();
     PrintBanner();
     PrintSession(r.session);
     r.initial.timeUtc = NowIso8601Utc();
@@ -451,6 +452,7 @@ int RunVirtualDisplay(Report& r) {
         r.actionLog.push_back(s);
     };
 
+    r.session = QuerySessionInfo();
     PrintBanner();
     PrintSession(r.session);
 

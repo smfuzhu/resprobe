@@ -28,7 +28,7 @@ DEPS     := $(OBJS:.o=.d)
 RCOBJ    := $(BUILDDIR)/res.o
 RC_SRCS  := $(RESDIR)/resprobe.rc $(RESDIR)/resprobe.manifest $(RESDIR)/resprobe.ico
 
-.PHONY: all clean run icon
+.PHONY: all clean run icon test
 
 all: $(TARGET)
 
@@ -58,8 +58,26 @@ icon:
 run: $(TARGET)
 	$(TARGET) snapshot
 
+# ---- 单元测试 ---------------------------------------------------------------
+# 只链接"除 main.o 外"的全部目标文件，复用同一批编译产物。
+# 刻意**不**链接资源对象(RCOBJ)：RCOBJ 里的 manifest 是 requireAdministrator，
+# 带它进来会让测试程序也需要提权才能运行。
+TESTBIN  := resprobe-tests.exe
+TEST_OBJS := $(filter-out $(BUILDDIR)/main.o,$(OBJS))
+
+$(BUILDDIR)/test_main.o: tests/test_main.cpp | $(BUILDDIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(TESTBIN): $(TEST_OBJS) $(BUILDDIR)/test_main.o
+	$(CXX) $(TEST_OBJS) $(BUILDDIR)/test_main.o -o $@ $(LDFLAGS) $(LIBS)
+	@echo.
+	@echo Build OK (tests): $(TESTBIN)
+
+test: $(TESTBIN)
+	$(TESTBIN)
+
 clean:
-	-del /q $(BUILDDIR)\*.o $(BUILDDIR)\*.d $(TARGET) 2>nul
+	-del /q $(BUILDDIR)\*.o $(BUILDDIR)\*.d $(TARGET) $(TESTBIN) 2>nul
 	-rmdir /q $(BUILDDIR) 2>nul
 
 -include $(DEPS)

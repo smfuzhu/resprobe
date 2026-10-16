@@ -288,15 +288,20 @@ TopologyState EvaluateTopology(UINT32 refW, UINT32 refH) {
 
         // 无 EDID 且不属于已知虚拟适配器：可能是克隆态的虚拟屏（DisplayConfig 会把它
         // 报在源适配器上，靠适配器识别不出来），也可能是链路断开的物理屏。
-        // 以"当前分辨率是否低于参考分辨率"区分：虚拟屏处于参考分辨率，死输出会回退。
+        // 以"当前分辨率是否不低于参考分辨率"区分：克隆态虚拟屏处在参考分辨率，
+        // 死输出则回退到远低于参考分辨率的驱动默认模式。
+        //
+        // area == 0 表示模式信息缺失（通常正处于重配置过程中），此时**不能**判为
+        // "存在虚拟屏"——否则会虚增 activeVirtualCount，让 ensure 误以为有可用虚拟
+        // 输出而给出错误结论。这种未知态一律保守地按死输出处理。
         UINT64 area = (UINT64)t.width * (UINT64)t.height;
         UINT64 refArea = (UINT64)refW * (UINT64)refH;
-        if (area > 0 && area < refArea) {
-            ++st.deadPhysicalCount;
-            st.deadPhysicalDevices.push_back(t.gdiDeviceName);
-        } else {
+        if (area > 0 && area >= refArea) {
             ++st.activeVirtualCount;
             st.activeVirtualDevices.push_back(t.gdiDeviceName);
+        } else {
+            ++st.deadPhysicalCount;
+            st.deadPhysicalDevices.push_back(t.gdiDeviceName);
         }
     }
 
@@ -489,18 +494,33 @@ LONG DetachOutputs(const std::vector<std::wstring>& gdiDeviceNames) {
     }
     if (wanted.empty()) return ERROR_SUCCESS;
 
+    // 与 EnumerateDisplays 同理：两步查询之间拓扑可能变化，需对
+    // ERROR_INSUFFICIENT_BUFFER 重取尺寸重试，避免摘除操作静默失败。
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
     UINT32 numPaths = 0;
     UINT32 numModes = 0;
-    LONG rc = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths, &numModes);
-    if (rc != ERROR_SUCCESS) return rc;
-
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
-    rc = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths, paths.data(),
-                            &numModes, modes.data(), nullptr);
-    if (rc != ERROR_SUCCESS) return rc;
-    paths.resize(numPaths);
-    modes.resize(numModes);
+    LONG rc = ERROR_SUCCESS;
+    bool queryOk = false;
+    const int kMaxAttempts = 4;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        rc = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths, &numModes);
+        if (rc != ERROR_SUCCESS) break;
+        paths.resize(numPaths);
+        modes.resize(numModes);
+        rc = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths,
+                                paths.empty() ? nullptr : paths.data(),
+                                &numModes, modes.empty() ? nullptr : modes.data(),
+                                nullptr);
+        if (rc == ERROR_SUCCESS) {
+            paths.resize(numPaths);
+            modes.resize(numModes);
+            queryOk = true;
+            break;
+        }
+        if (rc != ERROR_INSUFFICIENT_BUFFER) break;   // 非竞态类错误，重试无意义
+    }
+    if (!queryOk) return rc;
 
     std::vector<DISPLAYCONFIG_PATH_INFO> kept;
     int removed = 0;

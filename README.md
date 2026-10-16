@@ -492,14 +492,11 @@ docs(readme): 补充安装、使用示例、贡献指南与已知限制
 
 ### 11.1 本项目自身
 
-**尚未声明许可证（未指定 / NOASSERTION）**。
+**MIT License**（完整条款见仓库根目录的 [`LICENSE`](LICENSE)）。
 
-在对外发布或接受外部贡献之前，**必须先由项目所有者选定许可证**（例如 MIT / Apache-2.0，
-或明确写为"内部专用、保留所有权利"），并落到仓库根目录的 `LICENSE` 文件中、同时更新本节。
+Copyright (c) 2026 ResProbe contributors。可自由使用、修改、分发，须保留版权与许可声明。
 
-在选定之前，默认按"**内部使用、保留所有权利**"处理：**请勿对外分发**本仓库源码或二进制。
-（`res\resprobe.rc` 里的 `LegalCopyright` 当前写的是 `Provided as-is for internal diagnostics use`，
-选定许可证后需同步修改并重新编译。）
+（`res\resprobe.rc` 里的 `LegalCopyright` 与本节的许可证保持一致；改动后需重新编译。）
 
 ### 11.2 第三方组件（必须保留本节）
 
@@ -553,11 +550,12 @@ docs(readme): 补充安装、使用示例、贡献指南与已知限制
 
 **发布前必须解决（阻塞项）**
 
-1. **选定许可证**并添加 `LICENSE` 文件（§11.1）。
+1. **选定许可证**并添加 `LICENSE` 文件（§11.1）。—— 已完成：采用 **MIT**，见根目录 `LICENSE`。
 2. **确认 usbmmidd 的广告行为与致谢义务**（§11.2）。
 3. 增加 `.gitignore` 并完成首次提交（本次已随 README 一起提供）。
 4. 明确"只读命令也需要管理员"是否可接受，或拆出免提升的只读入口。
-5. 无自动化测试与 CI：唯一的回归入口是人工 `resprobe.exe selftest`（需管理员 + 真实硬件）。
+5. 无自动化测试与 CI：已补充 `make test`（覆盖 `verdict.cpp` 判定引擎与编码解码，无需管理员/硬件）；
+   托盘动作层的唯一回归入口仍是人工 `resprobe.exe selftest`（需管理员 + 真实硬件），CI 尚未接入。
 
 ## 13. 版本记录
 

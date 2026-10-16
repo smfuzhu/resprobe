@@ -140,38 +140,43 @@ std::vector<DisplayTarget> EnumerateDisplays(UINT32 refW, UINT32 refH,
     EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(&monCtx));
 
     // ---- 4. DisplayConfig 路径 ----
-    UINT32 numPaths = 0;
-    UINT32 numModes = 0;
-    LONG rc = GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes);
-    if (rc != ERROR_SUCCESS) {
-        char buf[128];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "GetDisplayConfigBufferSizes 失败 rc=%ld", (long)rc);
-        notes += buf;
-        if (totalPathsOut) *totalPathsOut = 0;
-        if (diagOut) *diagOut = U82W(notes);
-        return out;
-    }
-
+    // GetDisplayConfigBufferSizes 与 QueryDisplayConfig 之间拓扑可能变化（本工具
+    // 恰恰要在"事件发生的瞬间"取证），此时 QueryDisplayConfig 返回
+    // ERROR_INSUFFICIENT_BUFFER。标准做法是重取尺寸重试，否则会在最需要数据的
+    // 时刻静默返回空列表，进而可能被误判为"活动输出消失"。
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
-    paths.resize(numPaths);
-    modes.resize(numModes);
-
-    rc = QueryDisplayConfig(QDC_ALL_PATHS,
-                            &numPaths, paths.empty() ? nullptr : paths.data(),
-                            &numModes, modes.empty() ? nullptr : modes.data(),
-                            nullptr);
-    if (rc != ERROR_SUCCESS) {
+    UINT32 numPaths = 0;
+    UINT32 numModes = 0;
+    LONG rc = ERROR_SUCCESS;
+    bool queryOk = false;
+    const int kMaxAttempts = 4;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        rc = GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes);
+        if (rc != ERROR_SUCCESS) break;
+        paths.resize(numPaths);
+        modes.resize(numModes);
+        rc = QueryDisplayConfig(QDC_ALL_PATHS,
+                                &numPaths, paths.empty() ? nullptr : paths.data(),
+                                &numModes, modes.empty() ? nullptr : modes.data(),
+                                nullptr);
+        if (rc == ERROR_SUCCESS) {
+            paths.resize(numPaths);
+            modes.resize(numModes);
+            queryOk = true;
+            break;
+        }
+        if (rc != ERROR_INSUFFICIENT_BUFFER) break;   // 非竞态类错误，重试无意义
+    }
+    if (!queryOk) {
         char buf[128];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "QueryDisplayConfig 失败 rc=%ld", (long)rc);
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "DisplayConfig 查询失败 rc=%ld（重试上限 %d）", (long)rc, kMaxAttempts);
         notes += buf;
         if (totalPathsOut) *totalPathsOut = 0;
         if (diagOut) *diagOut = U82W(notes);
         return out;
     }
-    paths.resize(numPaths);
-    modes.resize(numModes);
 
     char tmp[160];
     _snprintf_s(tmp, sizeof(tmp), _TRUNCATE,

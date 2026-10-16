@@ -658,7 +658,7 @@ void TrayIcon::ActShowAbout() {
          L"  - 常驻监听显示事件，链路断开时自动接管\r\n\r\n";
     t += L"程序目录：" + GetHomeDir() + L"\r\n";
     t += L"输出目录：" + GetOutDirPath() + L"\r\n\r\n";
-    t += L"命令行子命令：snapshot / watch / verify / paths / record / ensure / restore / tray";
+    t += L"命令行子命令：snapshot / watch / verify / paths / ensure / vdisplay / restore / tray / selftest";
 
     Info(L"关于 ResProbe", t);
 }

@@ -236,13 +236,25 @@ std::wstring DefaultOutDir() {
 bool EnsureDirectoryExists(const std::wstring& dir) {
     if (dir.empty()) return false;
 
-    // 逐级创建，容忍已存在
-    std::wstring cur;
-    for (size_t i = 0; i < dir.size(); ++i) {
+    // 逐级创建，容忍已存在。
+    //
+    // 边界：UNC（\\server\share\...）与以分隔符开头的路径，不能从第一个字符就
+    // 开始建目录 —— 在首个 "\" / "/" 处调用 CreateDirectoryW 会去创建当前驱动器
+    // 根（如 "\"），那是完全错误的目标。做法是跳过开头连续的分隔符，保留
+    // UNC / 根前缀原样后再从第一个真实分量开始逐级创建。
+    size_t start = 0;
+    while (start < dir.size() && (dir[start] == L'\\' || dir[start] == L'/')) ++start;
+
+    std::wstring cur = dir.substr(0, start);
+    for (size_t i = start; i < dir.size(); ++i) {
         cur.push_back(dir[i]);
         if (dir[i] == L'\\' || dir[i] == L'/') {
             bool isDriveRoot = (cur.size() == 3 && cur[1] == L':');
-            if (!isDriveRoot) CreateDirectoryW(cur.c_str(), nullptr);
+            // cur.size() > start + 1：跳过"只有前缀和分隔符"的情形，
+            // 避免对根/空分量调用 CreateDirectoryW。
+            if (!isDriveRoot && cur.size() > start + 1) {
+                CreateDirectoryW(cur.c_str(), nullptr);
+            }
         }
     }
     if (CreateDirectoryW(dir.c_str(), nullptr)) return true;

@@ -111,6 +111,9 @@ std::string UpperAscii(const std::string& s) {
 }
 
 std::wstring UpperW(const std::wstring& s) {
+    // 空串时 &r[0] 是退化引用（CharUpperBuffW 计数为 0 虽不写入，但取址本身
+    // 在旧标准下未定义），这里直接早退，避免把 UB 留给调用方。
+    if (s.empty()) return std::wstring();
     std::wstring r = s;
     CharUpperBuffW(&r[0], (DWORD)r.size());
     return r;
