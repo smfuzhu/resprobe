@@ -19,21 +19,36 @@
 
 namespace resprobe {
 
-// 托盘图标的三种形态，资源 ID 见 res/resprobe.rc（1=默认, 2=绿, 3=蓝）。
+// 托盘图标的五种形态，资源 ID 见 res/resprobe.rc（1=默认, 2=绿, 3=蓝, 4=红, 5=黄）。
 //
-// 取值优先级（UpdateTrayIcon）：
-//   1) Windows 已关闭显示输出（GUID_CONSOLE_DISPLAY_STATE = Off） -> DisplayOff（蓝）
-//      放在第一位：这是操作系统层面的事实，比"显示器在不在"更能解释"屏幕为什么黑"。
-//   2) 仍有物理显示器挂在线上（活动输出带 EDID 且设备节点在）      -> MonitorOnline（绿）
-//   3) 其余情况                                                   -> Default（原图标）
+// 取值优先级（UpdateTrayIcon），从高到低：
+//   1) NoFallback      没有可用的虚拟显示输出            -> 红
+//                      物理屏一旦断电就会掉分辨率且无人接（等价 ensure 返回 20）。
+//   2) FallbackActive  没有健康的物理屏，但仍有输出在活动  -> 黄
+//                      虚拟屏正扛着桌面，即"兜底中"。
+//   3) DisplayOff      Windows 关闭了显示输出            -> 蓝
+//   4) MonitorOnline   仍有物理显示器在线                -> 绿
+//   5) Default         其余（含状态未知）                 -> 默认图标
 //
-// 注意第 2 条的判据是 healthyPhysical：它同时要求 EDID 可读 + 监视器设备节点存在，
-// 与 verify.cpp 的 IsLinkHealthy 同源，避免"虚拟屏兜底中"被误当成"显示器在线"。
+// 为什么红/黄要压过蓝："OS 空闲关屏"是常态且无害，而"兜底中 / 无兜底"才是要看的。
+// 若蓝压过黄，一次空闲关屏就会把兜底状态盖掉，新增的两态等于白加。
+//
+// 判据说明：healthyPhysical 同时要求 EDID 可读 + 监视器设备节点存在（与
+// IsLinkHealthy 同源），因此"虚拟屏兜底中"不会被误判成"显示器在线"；
+// 而 primaryMode 为空表示这次探测什么都没采到（枚举失败 / 无任何活动输出），
+// 此时一律退回默认，避免把瞬态误报成红色告警。
 enum class TrayIconState {
     Default = 0,
     MonitorOnline,
     DisplayOff,
+    FallbackActive,
+    NoFallback,
 };
+
+// 由状态摘要与电源状态推导托盘形态。抽成纯函数是为了让它能在不碰硬件、
+// 不需要管理员权限的情况下被完整验证（五种分支各构造一份 TrayStatus 即可）；
+// 判据与优先级见上面 TrayIconState 的注释。
+TrayIconState DecideTrayIconState(const TrayStatus& st, DisplayPowerState power);
 
 class TrayIcon {
 public:
@@ -69,6 +84,10 @@ private:
     // Shell_NotifyIconW(NIM_MODIFY)（无谓的调用会让任务栏图标闪烁）。
     void UpdateTrayIcon();
 
+    // 托盘提示与图标保持同步：状态变化或主输出分辨率变化时更新，
+    // 文本没变就不发 NIM_MODIFY。
+    void RefreshTip();
+
     // GUID_CONSOLE_DISPLAY_STATE 通知：WM_POWERBROADCAST / PBT_POWERSETTINGCHANGE
     void OnPowerSetting(WPARAM wp, LPARAM lp);
 
@@ -98,6 +117,8 @@ private:
     HICON icon_ = nullptr;          // 默认（resprobe.rc ID 1）
     HICON iconGreen_ = nullptr;     // 显示器在线（ID 2）
     HICON iconBlue_ = nullptr;      // 显示输出已关闭（ID 3）
+    HICON iconRed_ = nullptr;       // 无兜底（ID 4）
+    HICON iconYellow_ = nullptr;    // 兜底中（ID 5）
     HPOWERNOTIFY powerNotify_ = nullptr;
     DisplayPowerState powerState_ = DisplayPowerState::Unknown;
     TrayIconState iconState_ = TrayIconState::Default;
@@ -105,6 +126,7 @@ private:
     bool iconInstalled_ = false;
     UINT taskbarCreatedMsg_ = 0;
     NOTIFYICONDATAW nid_{};
+    std::wstring lastTip_;          // 上次下发的提示文本，用于避免重复 NIM_MODIFY
 
     UINT32 refW_ = 1920;
     UINT32 refH_ = 1080;

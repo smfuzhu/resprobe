@@ -20,6 +20,19 @@ const UINT kTrayCallbackMsg = WM_APP + 101;
 const int kIconResourceId      = 1;   // resprobe.ico        默认
 const int kIconGreenResourceId = 2;   // resprobe-green.ico  显示器在线
 const int kIconBlueResourceId  = 3;   // resprobe-blue.ico   显示输出已关闭
+const int kIconRedResourceId   = 4;   // resprobe-red.ico    无兜底
+const int kIconYellowResourceId= 5;   // resprobe-yellow.ico 兜底中
+
+// 五种形态在托盘提示里的后缀（与图标一一对应，鼠标悬停时给一层文字确认）
+const wchar_t* TrayStateSuffix(TrayIconState s) {
+    switch (s) {
+        case TrayIconState::MonitorOnline:  return L" · 显示器在线";
+        case TrayIconState::DisplayOff:     return L" · 显示输出已关闭";
+        case TrayIconState::FallbackActive: return L" · 兜底中";
+        case TrayIconState::NoFallback:     return L" · 无兜底";
+        default:                            return L"";
+    }
+}
 
 // 托盘自身的状态刷新定时器。
 //
@@ -84,10 +97,14 @@ bool TrayIcon::Create(UINT32 refW, UINT32 refH) {
     }
     iconGreen_ = LoadIconW(inst_, MAKEINTRESOURCEW(kIconGreenResourceId));
     iconBlue_  = LoadIconW(inst_, MAKEINTRESOURCEW(kIconBlueResourceId));
+    iconRed_   = LoadIconW(inst_, MAKEINTRESOURCEW(kIconRedResourceId));
+    iconYellow_= LoadIconW(inst_, MAKEINTRESOURCEW(kIconYellowResourceId));
 
     LogLine("[托盘] 图标资源: 默认=" + std::string(icon_ ? "OK" : "缺失") +
             " 绿(在线)=" + std::string(iconGreen_ ? "OK" : "缺失") +
-            " 蓝(显示输出已关闭)=" + std::string(iconBlue_ ? "OK" : "缺失"));
+            " 蓝(显示输出已关闭)=" + std::string(iconBlue_ ? "OK" : "缺失") +
+            " 红(无兜底)=" + std::string(iconRed_ ? "OK" : "缺失") +
+            " 黄(兜底中)=" + std::string(iconYellow_ ? "OK" : "缺失"));
 
     // 显示器电源状态（开/关/低功耗）。
     //
@@ -116,7 +133,7 @@ bool TrayIcon::Create(UINT32 refW, UINT32 refH) {
     // 先做一次探测，让第一次右键就有内容
     RefreshStatusCache(true);
     RefreshModeCache(true);
-    SetTip(L"ResProbe " + status_.primaryMode);
+    RefreshTip();
 
     return true;
 }
@@ -203,23 +220,43 @@ void TrayIcon::RefreshStatusCache(bool force) {
     status_ = QueryTrayStatus(refW_, refH_);
     statusStampMs_ = now;
 
-    // 状态刚刷新完，同步一次图标（显示器在线与否只存在于这份探测结果里）
+    // 状态刚刷新完，同步一次图标与提示（显示器在线与否只存在于这份探测结果里）
     UpdateTrayIcon();
+    RefreshTip();
+}
+
+// ---------------------------------------------------------------------------
+// 五种形态的判定（纯函数）
+// ---------------------------------------------------------------------------
+TrayIconState DecideTrayIconState(const TrayStatus& st, DisplayPowerState power) {
+    // primaryMode 为空 = 这次探测什么都没采到（枚举失败，或当前没有任何活动输出）。
+    // 此时不能判"无兜底"—— 那会把一次瞬时失败报成红色告警。
+    if (st.primaryMode.empty()) return TrayIconState::Default;
+
+    if (st.virtualAvailable <= 0) {
+        // 没有虚拟显示输出可用：物理屏一旦断电就会掉分辨率且无人接
+        return TrayIconState::NoFallback;
+    }
+    if (st.healthyPhysical <= 0 && st.totalActive > 0) {
+        // 没有健康的物理屏，但仍有输出在活动 -> 虚拟屏正扛着桌面
+        return TrayIconState::FallbackActive;
+    }
+    if (power == DisplayPowerState::Off) {
+        // Windows 关闭了显示输出（空闲 / 锁屏）；此时物理屏通常还在线
+        return TrayIconState::DisplayOff;
+    }
+    if (st.healthyPhysical > 0) {
+        // 活动输出带 EDID 且监视器设备节点存在
+        return TrayIconState::MonitorOnline;
+    }
+    return TrayIconState::Default;
 }
 
 // ---------------------------------------------------------------------------
 void TrayIcon::UpdateTrayIcon() {
     if (!iconInstalled_) return;
 
-    TrayIconState want = TrayIconState::Default;
-    if (powerState_ == DisplayPowerState::Off) {
-        // Windows 已关闭显示输出：这比"显示器在不在"更能解释屏幕为什么是黑的，
-        // 因此优先级最高。
-        want = TrayIconState::DisplayOff;
-    } else if (status_.healthyPhysical > 0) {
-        // 仍有物理显示器在线：活动输出带 EDID 且监视器设备节点存在
-        want = TrayIconState::MonitorOnline;
-    }
+    const TrayIconState want = DecideTrayIconState(status_, powerState_);
 
     if (want == iconState_) return;
 
@@ -228,6 +265,10 @@ void TrayIcon::UpdateTrayIcon() {
         h = iconGreen_ ? iconGreen_ : icon_;
     } else if (want == TrayIconState::DisplayOff) {
         h = iconBlue_ ? iconBlue_ : icon_;
+    } else if (want == TrayIconState::FallbackActive) {
+        h = iconYellow_ ? iconYellow_ : icon_;
+    } else if (want == TrayIconState::NoFallback) {
+        h = iconRed_ ? iconRed_ : icon_;
     }
     if (!h) return;
 
@@ -236,10 +277,28 @@ void TrayIcon::UpdateTrayIcon() {
     nid_.hIcon = h;
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
 
-    const char* name = (want == TrayIconState::MonitorOnline) ? "绿(显示器在线)"
-                     : (want == TrayIconState::DisplayOff)    ? "蓝(显示输出已关闭)"
-                                                              : "默认";
+    const char* name = (want == TrayIconState::MonitorOnline)  ? "绿(显示器在线)"
+                     : (want == TrayIconState::DisplayOff)     ? "蓝(显示输出已关闭)"
+                     : (want == TrayIconState::FallbackActive) ? "黄(兜底中)"
+                     : (want == TrayIconState::NoFallback)     ? "红(无兜底)"
+                                                               : "默认";
     LogLine(std::string("[托盘] 图标 -> ") + name);
+
+    // 图标换了，提示必须跟着换，否则悬停看到的还是旧状态
+    RefreshTip();
+}
+
+// ---------------------------------------------------------------------------
+void TrayIcon::RefreshTip() {
+    if (!iconInstalled_) return;
+
+    std::wstring mode = status_.primaryMode.empty() ? L"(状态未知)" : status_.primaryMode;
+    const std::wstring tip = L"ResProbe " + mode + TrayStateSuffix(iconState_);
+    if (tip == lastTip_) return;   // 没变就不发 NIM_MODIFY
+    lastTip_ = tip;
+    SetTip(tip);
+    // 提示文本无法从外部读取，落一条日志才能核对"图标与提示是否同步"
+    LogLine("[托盘] 提示 -> " + W2U8(tip));
 }
 
 // ---------------------------------------------------------------------------
@@ -294,11 +353,13 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (taskbarCreatedMsg_ != 0 && msg == taskbarCreatedMsg_) {
         iconInstalled_ = false;
         AddNotificationIcon();
-        SetTip(L"ResProbe " + status_.primaryMode);
+        RefreshTip();
         // NIM_ADD 用的是默认图标，这里必须重判一次，否则 explorer 重启后
         // "在线/已关闭"的形态会丢失。
         iconState_ = TrayIconState::Default;
+        lastTip_.clear();   // NIM_ADD 会把提示重置成 "ResProbe"，必须重发
         UpdateTrayIcon();
+        RefreshTip();
         return 0;
     }
 
@@ -577,7 +638,7 @@ void TrayIcon::ActShowStatus() {
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
 
     const std::wstring text = BuildStatusReport(status_, refW_, refH_);
-    SetTip(L"ResProbe " + status_.primaryMode);
+    RefreshTip();
 
     // busy_ 保持到弹窗之后才清：MessageBox 有自己的嵌套消息循环，
     // 期间用户若又点了托盘，busy_ 能拦住叠菜单
@@ -653,7 +714,7 @@ void TrayIcon::ActApplyResolution(UINT32 w, UINT32 h) {
     // 分辨率变了，缓存全部作废
     RefreshModeCache(true);
     RefreshStatusCache(true);
-    SetTip(L"ResProbe " + status_.primaryMode);
+    RefreshTip();
 
     const bool ok = (rr.applied && rr.after == want);
     std::wstring text = rr.message;
@@ -688,7 +749,7 @@ void TrayIcon::ActAutostart(bool enable, bool guardMode) {
 
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
     AutostartState as = QueryAutostart();
-    SetTip(L"ResProbe " + status_.primaryMode);
+    RefreshTip();
 
     std::wstring text = message;
     text += L"\r\n\r\n当前状态：\r\n";
@@ -725,7 +786,7 @@ void TrayIcon::ActRunScriptAction(const std::wstring& role, const std::wstring& 
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
     RefreshStatusCache(true);
     RefreshModeCache(true);
-    SetTip(L"ResProbe " + status_.primaryMode);
+    RefreshTip();
 
     std::wstring text;
 

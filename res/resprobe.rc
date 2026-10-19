@@ -9,20 +9,24 @@
  *  All resource names below are bare numbers so no windows.h include is needed.
  *
  *      ID 1  RT_ICON        -> not used directly, the ICO carries its own set
- *      1     ICON (3)       -> resprobe.ico        default tray icon
- *      2     ICON (3)       -> resprobe-green.ico  monitor still online
+ *      1     ICON (3)       -> resprobe.ico        default
+ *      2     ICON (3)       -> resprobe-green.ico  monitor online
  *      3     ICON (3)       -> resprobe-blue.ico   Windows turned the display off
+ *      4     ICON (3)       -> resprobe-red.ico    no virtual-display fallback
+ *      5     ICON (3)       -> resprobe-yellow.ico fallback active (virtual carries desktop)
  *      1     RT_MANIFEST(24)-> resprobe.manifest (elevation + compatibility)
  *
- *  The three ICON ids are selected at runtime by src/tray.cpp (TrayIconState).
- *  Regenerate all three with `make icon`; do not hand-edit the .ico files.
+ *  The five ICON ids are selected at runtime by src/tray.cpp (TrayIconState).
+ *  Regenerate all five with `make icon`; do not hand-edit the .ico files.
  * ===========================================================================
  */
 
-/* ---- tray icons: default / online (green) / display off (blue) ----------- */
+/* ---- tray icons: default / online / display off / no fallback / fallback -- */
 1 ICON "resprobe.ico"
 2 ICON "resprobe-green.ico"
 3 ICON "resprobe-blue.ico"
+4 ICON "resprobe-red.ico"
+5 ICON "resprobe-yellow.ico"
 
 /* ---- manifest: requireAdministrator, DPI awareness, supported OS ---------- */
 1 24 "resprobe.manifest"

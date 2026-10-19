@@ -1,10 +1,12 @@
 # ===========================================================================
 #  ResProbe - icon generator
 #
-#  Produces three variants of the tray icon:
-#      res\resprobe.ico        default  (screen: cyan -> deep blue gradient)
-#      res\resprobe-green.ico  monitor online   (screen: light -> deep green)
-#      res\resprobe-blue.ico   display output off (screen: dim solid blue)
+#  Produces five variants of the tray icon:
+#      res\resprobe.ico        default   (screen: cyan -> deep blue gradient)
+#      res\resprobe-green.ico  monitor online          (screen: light -> deep green)
+#      res\resprobe-blue.ico   display output off      (screen: dim solid blue)
+#      res\resprobe-red.ico    no fallback available   (screen: light -> deep red)
+#      res\resprobe-yellow.ico fallback active         (screen: light -> deep amber)
 #
 #  The three files are committed to the repository so the build does NOT
 #  require this script; it only needs to be re-run when the artwork changes:
@@ -256,6 +258,16 @@ $palettes = @(
         File   = 'resprobe-blue.ico'
         Screen = [System.Drawing.Color]::FromArgb(255,  56, 110, 180)   # dim blue
         Deep   = [System.Drawing.Color]::FromArgb(255,  14,  30,  62)   # navy
+    },
+    [pscustomobject]@{
+        File   = 'resprobe-red.ico'
+        Screen = [System.Drawing.Color]::FromArgb(255, 248, 113, 113)   # light red
+        Deep   = [System.Drawing.Color]::FromArgb(255, 180,  35,  24)   # deep red
+    },
+    [pscustomobject]@{
+        File   = 'resprobe-yellow.ico'
+        Screen = [System.Drawing.Color]::FromArgb(255, 255, 214, 102)   # light amber
+        Deep   = [System.Drawing.Color]::FromArgb(255, 199, 126,  10)   # deep amber
     }
 )
 
