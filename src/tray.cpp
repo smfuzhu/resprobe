@@ -16,8 +16,19 @@ const wchar_t kTrayClassName[] = L"ResProbeTrayHost";
 // 自定义回调消息：Shell_NotifyIcon 会把鼠标事件投递到这个消息上
 const UINT kTrayCallbackMsg = WM_APP + 101;
 
-// 资源脚本里的图标 ID（res/resprobe.rc: `1 ICON "resprobe.ico"`）
-const int kIconResourceId = 1;
+// 资源脚本里的图标 ID（见 res/resprobe.rc）
+const int kIconResourceId      = 1;   // resprobe.ico        默认
+const int kIconGreenResourceId = 2;   // resprobe-green.ico  显示器在线
+const int kIconBlueResourceId  = 3;   // resprobe-blue.ico   显示输出已关闭
+
+// 托盘自身的状态刷新定时器。
+//
+// 为什么必须加：图标要反映"显示器是否还在线"，而这条信息只存在于周期性探测里
+// （EDID 走 SetupAPI，没有事件通知）。电源状态是事件驱动的、到得很快，但物理
+// 显示器的插拔/掉电只有 WM_DEVICECHANGE 这种粗粒度信号，靠它不准。
+// 5 秒一次是最折中的选择：用户能感觉到变化，单次 QueryTrayStatus 又是毫秒级。
+const UINT_PTR kTrayRefreshTimerId = 2;
+const UINT kTrayRefreshIntervalMs = 5000;
 
 // 菜单命令 ID
 enum MenuId : int {
@@ -71,6 +82,22 @@ bool TrayIcon::Create(UINT32 refW, UINT32 refH) {
         // 资源缺失时退化到系统图标，保证托盘仍可用
         icon_ = LoadIconW(nullptr, IDI_APPLICATION);
     }
+    iconGreen_ = LoadIconW(inst_, MAKEINTRESOURCEW(kIconGreenResourceId));
+    iconBlue_  = LoadIconW(inst_, MAKEINTRESOURCEW(kIconBlueResourceId));
+
+    LogLine("[托盘] 图标资源: 默认=" + std::string(icon_ ? "OK" : "缺失") +
+            " 绿(在线)=" + std::string(iconGreen_ ? "OK" : "缺失") +
+            " 蓝(显示输出已关闭)=" + std::string(iconBlue_ ? "OK" : "缺失"));
+
+    // 显示器电源状态（开/关/低功耗）。
+    //
+    // 托盘不能复用 Watcher 的注册：那是注册在 Watcher 自己的窗口上的，消息只会
+    // 投递到那个窗口。托盘窗口是同一线程上的另一个顶层窗口，必须自己注册一份。
+    // 注册失败不致命 —— 只是拿不到"Windows 关了显示输出"，图标退回默认形态。
+    powerNotify_ = RegisterPowerSettingNotification(
+        hwnd_, &kGuidConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+    LogLine("[托盘] 显示器电源状态通知注册" +
+            std::string(powerNotify_ ? "成功" : "失败（图标不区分显示输出关闭）"));
 
     AddNotificationIcon();
 
@@ -78,6 +105,12 @@ bool TrayIcon::Create(UINT32 refW, UINT32 refH) {
     // 否则进程在跑、控制台被隐藏、托盘却没有图标 —— 用户只会认为程序没启动。
     if (!iconInstalled_) {
         return false;
+    }
+
+    // 周期刷新：让图标在显示器插拔/掉电后能自己变回去，不必等用户右键。
+    refreshTimerId_ = SetTimer(hwnd_, kTrayRefreshTimerId, kTrayRefreshIntervalMs, nullptr);
+    if (!refreshTimerId_) {
+        LogLine("[托盘] 状态刷新定时器创建失败（图标只在右键/电源事件时更新）");
     }
 
     // 先做一次探测，让第一次右键就有内容
@@ -89,6 +122,14 @@ bool TrayIcon::Create(UINT32 refW, UINT32 refH) {
 }
 
 void TrayIcon::Destroy() {
+    if (powerNotify_) {
+        UnregisterPowerSettingNotification(powerNotify_);
+        powerNotify_ = nullptr;
+    }
+    if (hwnd_ && refreshTimerId_) {
+        KillTimer(hwnd_, refreshTimerId_);
+        refreshTimerId_ = 0;
+    }
     RemoveNotificationIcon();
     if (hwnd_) {
         DestroyWindow(hwnd_);
@@ -161,6 +202,63 @@ void TrayIcon::RefreshStatusCache(bool force) {
     }
     status_ = QueryTrayStatus(refW_, refH_);
     statusStampMs_ = now;
+
+    // 状态刚刷新完，同步一次图标（显示器在线与否只存在于这份探测结果里）
+    UpdateTrayIcon();
+}
+
+// ---------------------------------------------------------------------------
+void TrayIcon::UpdateTrayIcon() {
+    if (!iconInstalled_) return;
+
+    TrayIconState want = TrayIconState::Default;
+    if (powerState_ == DisplayPowerState::Off) {
+        // Windows 已关闭显示输出：这比"显示器在不在"更能解释屏幕为什么是黑的，
+        // 因此优先级最高。
+        want = TrayIconState::DisplayOff;
+    } else if (status_.healthyPhysical > 0) {
+        // 仍有物理显示器在线：活动输出带 EDID 且监视器设备节点存在
+        want = TrayIconState::MonitorOnline;
+    }
+
+    if (want == iconState_) return;
+
+    HICON h = icon_;
+    if (want == TrayIconState::MonitorOnline) {
+        h = iconGreen_ ? iconGreen_ : icon_;
+    } else if (want == TrayIconState::DisplayOff) {
+        h = iconBlue_ ? iconBlue_ : icon_;
+    }
+    if (!h) return;
+
+    iconState_ = want;
+    nid_.uFlags = NIF_ICON;
+    nid_.hIcon = h;
+    Shell_NotifyIconW(NIM_MODIFY, &nid_);
+
+    const char* name = (want == TrayIconState::MonitorOnline) ? "绿(显示器在线)"
+                     : (want == TrayIconState::DisplayOff)    ? "蓝(显示输出已关闭)"
+                                                              : "默认";
+    LogLine(std::string("[托盘] 图标 -> ") + name);
+}
+
+// ---------------------------------------------------------------------------
+void TrayIcon::OnPowerSetting(WPARAM, LPARAM lp) {
+    auto* setting = reinterpret_cast<POWERBROADCAST_SETTING*>(lp);
+    if (!setting) return;
+    if (!IsEqualGUID(setting->PowerSetting, kGuidConsoleDisplayState)) return;
+    if (setting->DataLength < sizeof(DWORD)) return;
+
+    const DWORD state = *(DWORD*)setting->Data;
+    powerState_ = (state == 0) ? DisplayPowerState::Off
+                : (state == 1) ? DisplayPowerState::On
+                : (state == 2) ? DisplayPowerState::Dimmed
+                               : DisplayPowerState::Unknown;
+
+    LogLine("[托盘] 电源通知(显示器状态)=" + W2U8(DisplayPowerStateName(powerState_)));
+
+    // 事件驱动，无需等定时器：这里直接重判一次图标
+    UpdateTrayIcon();
 }
 
 void TrayIcon::RefreshModeCache(bool force) {
@@ -197,6 +295,10 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         iconInstalled_ = false;
         AddNotificationIcon();
         SetTip(L"ResProbe " + status_.primaryMode);
+        // NIM_ADD 用的是默认图标，这里必须重判一次，否则 explorer 重启后
+        // "在线/已关闭"的形态会丢失。
+        iconState_ = TrayIconState::Default;
+        UpdateTrayIcon();
         return 0;
     }
 
@@ -215,6 +317,21 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
             }
         }
+
+        case WM_POWERBROADCAST:
+            if (wp == PBT_POWERSETTINGCHANGE) {
+                OnPowerSetting(wp, lp);
+                return TRUE;
+            }
+            break;
+
+        case WM_TIMER:
+            if (wp == kTrayRefreshTimerId) {
+                // 显示器在线与否没有事件通知，只能靠周期探测
+                RefreshStatusCache(true);
+                return 0;
+            }
+            break;
 
         case WM_CLOSE:
             // 菜单里的"退出"走这里，避免在 WndProc 内部同步 DestroyWindow 自己

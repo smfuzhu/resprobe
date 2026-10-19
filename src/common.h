@@ -301,6 +301,7 @@ struct Options {
     bool mirror = false;               // --mirror，把虚拟显示输出与主输出复制（镜像）
     bool guard = false;                // --guard，监听中检测到物理链路断链时自动提升虚拟屏
     bool noGuard = false;              // --no-guard，tray 专有：只提供托盘界面，不做任何拓扑动作
+    bool eventLog = true;              // 写精简事件日志 OUT\events.log（--no-event-log 关闭）
     bool quiet = false;
     bool verbose = false;
 };

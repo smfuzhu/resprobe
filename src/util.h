@@ -16,6 +16,7 @@ std::string Iso8601FromSystemTime(const SYSTEMTIME& st);
 UINT64 MonotonicMs();                      // GetTickCount64()
 std::string UptimeText(UINT64 ms);
 std::string LocalTimeText();
+std::string LocalStampText();
 
 // --- 字符串 ---
 std::string JsonEscape(const std::string& in);

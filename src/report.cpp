@@ -266,6 +266,218 @@ bool EnsureDirectoryExists(const std::wstring& dir) {
     return (attr != INVALID_FILE_ATTRIBUTES) && (attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// ---------------------------------------------------------------------------
+// 精简版事件日志
+// ---------------------------------------------------------------------------
+std::wstring DefaultEventLogPath() {
+    return DefaultOutDir() + L"\\events.log";
+}
+
+bool AppendEventLogLine(const std::wstring& path, const std::string& utf8Line) {
+    if (path.empty() || utf8Line.empty()) return false;
+
+    // 目标目录可能还不存在（首次运行、或目录被外部清理过）
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos && slash > 0) {
+        EnsureDirectoryExists(path.substr(0, slash));
+    }
+
+    std::string line = utf8Line;
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+    if (line.empty()) return false;
+    line += "\r\n";
+
+    // FILE_APPEND_DATA：写入自动定位到文件尾，多个进程同时追加不会互相覆盖。
+    // 共享标志必须带上 WRITE —— 这正是 guard.log 的已知现象：句柄独占导致
+    // 第二个进程的追加被拒（"The process cannot access the file ..."）。
+    // 常驻守卫与托盘是两个进程，都要往 events.log 里写。
+    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    DWORD written = 0;
+    const BOOL ok = WriteFile(h, line.c_str(), (DWORD)line.size(), &written, nullptr);
+    CloseHandle(h);
+    return ok && written == line.size();
+}
+
+// ---------------------------------------------------------------------------
+// events.log 共用的短标签助手
+// ---------------------------------------------------------------------------
+namespace {
+
+// 把事件触发原因压缩成短标签。
+//
+// 原始 trigger 是多个系统消息用 " + " 拼接而成，例如：
+//   "WM_DEVICECHANGE(设备移除) + WM_DISPLAYCHANGE(1920x1080 32bpp) + WM_DEVICECHANGE(设备到达)"
+// 在"一行一条"的日志里它要占到三分之一长度，而它只说明"什么触发了采样"，
+// 不说明"到底变了什么" —— 后者才是要查的东西。
+std::string CompactTriggerToken(const std::string& tok) {
+    const std::string kPowerPrefix = "电源通知(显示器状态)=";
+    if (tok.compare(0, kPowerPrefix.size(), kPowerPrefix) == 0) {
+        return "电源=" + tok.substr(kPowerPrefix.size());
+    }
+    if (tok == "PBT_APMRESUME")  return "唤醒";
+    if (tok == "heartbeat")      return "心跳";
+    if (tok == "initial")        return "启动";
+    if (tok == "final-state")    return "结束";
+    if (tok == "guard-promoted") return "守卫后";
+
+    // 只有 "NAME(detail)" 形状的才需要拆；裸词原样返回
+    const size_t open = tok.find('(');
+    if (open == std::string::npos || tok.empty() || tok[tok.size() - 1] != ')') {
+        return tok;
+    }
+    const std::string name = tok.substr(0, open);
+    const std::string detail = tok.substr(open + 1, tok.size() - open - 2);
+
+    if (name == "WM_DEVICECHANGE") return detail;
+    if (name == "WM_WTSSESSION_CHANGE") {
+        const size_t comma = detail.find(',');   // "远程连接, 会话=1" -> "远程连接"
+        return (comma == std::string::npos) ? detail : detail.substr(0, comma);
+    }
+    if (name == "WM_SETTINGCHANGE") return "设置变化";
+    if (name == "WM_DISPLAYCHANGE") {
+        // "1920x1080 32bpp" -> "1920x1080"：色深对定位分辨率问题没有增量
+        const size_t sp = detail.find(' ');
+        return "显示变化 " + ((sp == std::string::npos) ? detail : detail.substr(0, sp));
+    }
+    return name + "(" + detail + ")";
+}
+
+std::string CompactTrigger(const std::string& in) {
+    std::string out;
+    size_t start = 0;
+    bool first = true;
+    for (;;) {
+        const size_t sep = in.find(" + ", start);
+        const std::string tok = (sep == std::string::npos)
+                                    ? in.substr(start)
+                                    : in.substr(start, sep - start);
+        if (!tok.empty()) {
+            if (!first) out += "+";
+            out += CompactTriggerToken(tok);
+            first = false;
+        }
+        if (sep == std::string::npos) break;
+        start = sep + 3;
+    }
+    return out;
+}
+
+size_t CountActiveTargets(const std::vector<DisplayTarget>& v) {
+    size_t n = 0;
+    for (const auto& t : v) if (t.active) ++n;
+    return n;
+}
+
+}  // namespace
+
+std::wstring FormatEventLogLine(const EventRecord& ev) {
+    if (!ev.changed || ev.transitions.empty()) return std::wstring();
+
+    std::wstring line = U82W(LocalStampText());
+    line += L" #" + std::to_wstring(ev.index);
+    line += L" [" + U82W(CompactTrigger(ev.trigger)) + L"]";
+    for (size_t i = 0; i < ev.transitions.size(); ++i) {
+        line += (i == 0) ? L" " : L" | ";
+        line += U82W(ev.transitions[i]);
+    }
+    return line;
+}
+
+std::wstring SummarizeEventLogLine(const DisplaySnapshot& before,
+                                   const DisplaySnapshot& after,
+                                   const EventRecord& ev) {
+    if (!ev.changed) return std::wstring();
+
+    std::vector<std::wstring> items;
+
+    // ---- 1) 电源状态：通知优先、推断兜底，两者都变时合成一条 ----------------
+    {
+        std::wstring s;
+        if (before.powerState != after.powerState) {
+            s = L"电源(通知) " + DisplayPowerStateName(before.powerState) + L"->" +
+                DisplayPowerStateName(after.powerState);
+        }
+        if (before.powerStateInferred != after.powerStateInferred) {
+            const std::wstring t = L"电源(推断) " +
+                                   DisplayPowerStateName(before.powerStateInferred) + L"->" +
+                                   DisplayPowerStateName(after.powerStateInferred);
+            s = s.empty() ? t : (s + L" " + t);
+        }
+        if (!s.empty()) items.push_back(s);
+    }
+
+    // ---- 2) 主输出切换与分辨率 --------------------------------------------
+    if (before.primaryGdiDevice != after.primaryGdiDevice) {
+        items.push_back(L"主输出 " + before.primaryGdiDevice + L" -> " +
+                        after.primaryGdiDevice);
+    }
+    if (before.primaryMode != after.primaryMode) {
+        items.push_back(L"分辨率 " + before.primaryMode + L" -> " + after.primaryMode);
+    }
+
+    // ---- 3) 物理屏离线/在线：按监视器名聚合，同一台屏的多个克隆只记一次 ----
+    // "链路还在不在"用 EDID 或设备节点任一可读判定，与 IsLinkHealthy 同源。
+    std::map<std::wstring, const DisplayTarget*> afterByDev;
+    for (const auto& a : after.targets) afterByDev[a.gdiDeviceName] = &a;
+    std::map<std::wstring, const DisplayTarget*> beforeByDev;
+    for (const auto& b : before.targets) beforeByDev[b.gdiDeviceName] = &b;
+
+    auto keyOf = [](const DisplayTarget& t) -> std::wstring {
+        return t.monitorFriendlyName.empty() ? t.gdiDeviceName : t.monitorFriendlyName;
+    };
+    std::map<std::wstring, int> lost, gained;
+    for (const auto& b : before.targets) {
+        const auto it = afterByDev.find(b.gdiDeviceName);
+        if (it == afterByDev.end()) continue;          // 消失的走第 4 步
+        const DisplayTarget& a = *it->second;
+        const bool wasLinked = b.edid.present || b.monitorDeviceNodePresent;
+        const bool isLinked  = a.edid.present || a.monitorDeviceNodePresent;
+        if (wasLinked && !isLinked)      ++lost[keyOf(b)];
+        else if (!wasLinked && isLinked) ++gained[keyOf(a)];
+    }
+    for (const auto& kv : lost) {
+        items.push_back(L"物理屏离线 " + kv.first + L" x" + std::to_wstring(kv.second));
+    }
+    for (const auto& kv : gained) {
+        items.push_back(L"物理屏在线 " + kv.first + L" x" + std::to_wstring(kv.second));
+    }
+
+    // ---- 4) 输出出现/消失（已由"主输出"体现的不重复记）--------------------
+    for (const auto& a : after.targets) {
+        if (beforeByDev.count(a.gdiDeviceName)) continue;
+        if (a.gdiDeviceName == after.primaryGdiDevice) continue;
+        std::wstring mode = (a.width && a.height) ? L"=" + FormatModeText(a.width, a.height) : L"";
+        items.push_back(L"新输出 " + a.gdiDeviceName + mode);
+    }
+    for (const auto& b : before.targets) {
+        if (afterByDev.count(b.gdiDeviceName)) continue;
+        if (b.gdiDeviceName == before.primaryGdiDevice) continue;
+        items.push_back(L"输出消失 " + b.gdiDeviceName);
+    }
+
+    // ---- 5) 活动输出数 ----------------------------------------------------
+    const size_t ba = CountActiveTargets(before.targets);
+    const size_t aa = CountActiveTargets(after.targets);
+    if (ba != aa) {
+        items.push_back(L"活动 " + std::to_wstring(ba) + L" -> " + std::to_wstring(aa));
+    }
+
+    if (items.empty()) return std::wstring();
+
+    std::wstring line = U82W(LocalStampText());
+    line += L" #" + std::to_wstring(ev.index);
+    line += L" [" + U82W(CompactTrigger(ev.trigger)) + L"]";
+    for (size_t i = 0; i < items.size(); ++i) {
+        line += (i == 0) ? L" " : L" | ";
+        line += items[i];
+    }
+    return line;
+}
+
 std::wstring DefaultOutPath(const std::wstring& mode) {
     SYSTEMTIME st;
     GetLocalTime(&st);

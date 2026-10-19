@@ -1,9 +1,13 @@
 # ===========================================================================
 #  ResProbe - icon generator
 #
-#  Produces res\resprobe.ico (multi-size, 16/24/32/48/64/128/256).
-#  The .ico is committed to the repository so the build does NOT require this
-#  script; it only needs to be re-run when the artwork changes:
+#  Produces three variants of the tray icon:
+#      res\resprobe.ico        default  (screen: cyan -> deep blue gradient)
+#      res\resprobe-green.ico  monitor online   (screen: light -> deep green)
+#      res\resprobe-blue.ico   display output off (screen: dim solid blue)
+#
+#  The three files are committed to the repository so the build does NOT
+#  require this script; it only needs to be re-run when the artwork changes:
 #
 #      make icon
 #      (or) powershell -NoProfile -ExecutionPolicy Bypass -File res\make-icon.ps1
@@ -11,6 +15,13 @@
 #  ENCODING: this file is pure ASCII on purpose. Windows PowerShell 5.1 reads
 #  a .ps1 without a BOM as ANSI, so non-ASCII content here would be fragile.
 #  (Batch scripts have the same rule for a different reason - see DEVELOPMENT.md)
+#
+#  WHY THE "OFF" ICON IS A DARKER BLUE
+#    The default icon already reads as blue (cyan -> deep blue screen), so a
+#    second bright blue would be indistinguishable from it at 16x16. The
+#    "display output off" variant therefore uses a dim, low-contrast blue that
+#    also reads as "the screen is dark". Only the screen colours differ between
+#    variants - the monitor shell stays identical so the family stays coherent.
 #
 #  FORMAT NOTES
 #    * sizes <= 64 are written as 32bpp DIB entries (BITMAPINFOHEADER + BGRA
@@ -23,13 +34,10 @@
 Add-Type -AssemblyName System.Drawing
 $ErrorActionPreference = 'Stop'
 
-$outPath = Join-Path $PSScriptRoot 'resprobe.ico'
 $sizes   = @(16, 24, 32, 48, 64, 128, 256)
 $pngFrom = 128          # >= this size -> PNG entry, otherwise DIB entry
 
-$script:colShell  = [System.Drawing.Color]::FromArgb(255, 32, 42, 54)
-$script:colScreen = [System.Drawing.Color]::FromArgb(255, 96, 208, 255)
-$script:colDeep   = [System.Drawing.Color]::FromArgb(255, 21, 101, 192)
+$script:colShell = [System.Drawing.Color]::FromArgb(255, 32, 42, 54)
 
 function New-RoundedPath {
     param([double]$X, [double]$Y, [double]$W, [double]$H, [double]$R)
@@ -50,7 +58,9 @@ function New-RoundedPath {
 }
 
 function New-IconBitmap {
-    param([int]$S)
+    param([int]$S,
+          [System.Drawing.Color]$Screen,
+          [System.Drawing.Color]$Deep)
 
     $bmp = New-Object System.Drawing.Bitmap($S, $S, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g   = [System.Drawing.Graphics]::FromImage($bmp)
@@ -81,7 +91,7 @@ function New-IconBitmap {
     if ($sw -gt 0.5 -and $sh -gt 0.5) {
         $rect = New-Object System.Drawing.RectangleF($sx, $sy, $sw, $sh)
         $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-                    $rect, $script:colScreen, $script:colDeep, 90.0)
+                    $rect, $Screen, $Deep, 90.0)
         $screenPath = New-RoundedPath $sx $sy $sw $sh ([Math]::Max(0.5, $rad * 0.55))
         $g.FillPath($grad, $screenPath)
         $screenPath.Dispose()
@@ -165,62 +175,90 @@ function Get-PngBytes {
     return $bytes
 }
 
-# ---------------------------------------------------------------------------
-# render every size, then assemble the ICO container
-# ---------------------------------------------------------------------------
-$entries = @()
-foreach ($s in $sizes) {
-    $bmp = New-IconBitmap $s
-    if ($s -ge $pngFrom) {
-        $bytes = Get-PngBytes $bmp
-        $kind  = 'PNG'
-    } else {
-        $bytes = Get-DibBytes $bmp
-        $kind  = 'DIB'
+function Write-IconFile {
+    param([string]$Path,
+          [System.Drawing.Color]$Screen,
+          [System.Drawing.Color]$Deep)
+
+    $entries = @()
+    foreach ($s in $sizes) {
+        $bmp = New-IconBitmap $s $Screen $Deep
+        if ($s -ge $pngFrom) {
+            $bytes = Get-PngBytes $bmp
+            $kind  = 'PNG'
+        } else {
+            $bytes = Get-DibBytes $bmp
+            $kind  = 'DIB'
+        }
+        $bmp.Dispose()
+        $entries += [pscustomobject]@{ Size = $s; Data = $bytes; Kind = $kind }
     }
-    $bmp.Dispose()
-    $entries += [pscustomobject]@{ Size = $s; Data = $bytes; Kind = $kind }
-    Write-Output ("  {0,3}x{0,-3} {1,-4} {2,7} bytes" -f $s, $kind, $bytes.Length)
+
+    $fs = [System.IO.File]::Create($Path)
+    $bw = New-Object System.IO.BinaryWriter($fs)
+
+    # ICONDIR
+    $bw.Write([UInt16]0)
+    $bw.Write([UInt16]1)
+    $bw.Write([UInt16]$entries.Count)
+
+    # ICONDIRENTRY per image
+    $offset = 6 + (16 * $entries.Count)
+    foreach ($e in $entries) {
+        $dim = if ($e.Size -ge 256) { 0 } else { $e.Size }   # 0 means 256
+        $bw.Write([byte]$dim)
+        $bw.Write([byte]$dim)
+        $bw.Write([byte]0)      # color count (0 = truecolor)
+        $bw.Write([byte]0)      # reserved
+        $bw.Write([UInt16]1)    # planes
+        $bw.Write([UInt16]32)   # bit count
+        $bw.Write([UInt32]$e.Data.Length)
+        $bw.Write([UInt32]$offset)
+        $offset += $e.Data.Length
+    }
+
+    # NOTE: 3-argument overload again - see the comment in Get-DibBytes.
+    foreach ($e in $entries) { $bw.Write($e.Data, 0, $e.Data.Length) }
+
+    $bw.Flush()
+    $bw.Dispose()
+    $fs.Dispose()
+
+    $name = Split-Path $Path -Leaf
+    Write-Output ("wrote {0} ({1} bytes, {2} sizes)" -f $name, (Get-Item $Path).Length, $entries.Count)
+
+    # sanity check: can the shell's own decoder read it back?
+    try {
+        $icon = New-Object System.Drawing.Icon($Path)
+        Write-Output ("  verified: loads as Icon {0}x{1}" -f $icon.Width, $icon.Height)
+        $icon.Dispose()
+    } catch {
+        Write-Output ("  WARNING: System.Drawing.Icon could not load it: " + $_.Exception.Message)
+        exit 1
+    }
 }
 
-$fs = [System.IO.File]::Create($outPath)
-$bw = New-Object System.IO.BinaryWriter($fs)
+# ---------------------------------------------------------------------------
+# the three variants
+# ---------------------------------------------------------------------------
+$palettes = @(
+    [pscustomobject]@{
+        File   = 'resprobe.ico'
+        Screen = [System.Drawing.Color]::FromArgb(255,  96, 208, 255)   # cyan
+        Deep   = [System.Drawing.Color]::FromArgb(255,  21, 101, 192)   # deep blue
+    },
+    [pscustomobject]@{
+        File   = 'resprobe-green.ico'
+        Screen = [System.Drawing.Color]::FromArgb(255, 134, 239, 172)   # light green
+        Deep   = [System.Drawing.Color]::FromArgb(255,  20, 122,  71)   # deep green
+    },
+    [pscustomobject]@{
+        File   = 'resprobe-blue.ico'
+        Screen = [System.Drawing.Color]::FromArgb(255,  56, 110, 180)   # dim blue
+        Deep   = [System.Drawing.Color]::FromArgb(255,  14,  30,  62)   # navy
+    }
+)
 
-# ICONDIR
-$bw.Write([UInt16]0)
-$bw.Write([UInt16]1)
-$bw.Write([UInt16]$entries.Count)
-
-# ICONDIRENTRY per image
-$offset = 6 + (16 * $entries.Count)
-foreach ($e in $entries) {
-    $dim = if ($e.Size -ge 256) { 0 } else { $e.Size }   # 0 means 256
-    $bw.Write([byte]$dim)
-    $bw.Write([byte]$dim)
-    $bw.Write([byte]0)      # color count (0 = truecolor)
-    $bw.Write([byte]0)      # reserved
-    $bw.Write([UInt16]1)    # planes
-    $bw.Write([UInt16]32)   # bit count
-    $bw.Write([UInt32]$e.Data.Length)
-    $bw.Write([UInt32]$offset)
-    $offset += $e.Data.Length
-}
-
-# NOTE: 3-argument overload again - see the comment in Get-DibBytes.
-foreach ($e in $entries) { $bw.Write($e.Data, 0, $e.Data.Length) }
-
-$bw.Flush()
-$bw.Dispose()
-$fs.Dispose()
-
-Write-Output ("wrote {0} ({1} bytes, {2} sizes)" -f $outPath, (Get-Item $outPath).Length, $entries.Count)
-
-# sanity check: can the shell's own decoder read it back?
-try {
-    $icon = New-Object System.Drawing.Icon($outPath)
-    Write-Output ("verified: loads as Icon {0}x{1}" -f $icon.Width, $icon.Height)
-    $icon.Dispose()
-} catch {
-    Write-Output ("WARNING: System.Drawing.Icon could not load it: " + $_.Exception.Message)
-    exit 1
+foreach ($p in $palettes) {
+    Write-IconFile -Path (Join-Path $PSScriptRoot $p.File) -Screen $p.Screen -Deep $p.Deep
 }

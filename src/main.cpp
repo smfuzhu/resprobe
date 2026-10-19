@@ -87,6 +87,7 @@ void PrintUsage() {
     LogLine("                      纯文件名会落到输出目录（默认 <程序目录>\\OUT）");
     LogLine("  --out-dir DIR       覆盖默认输出目录（默认 <程序目录>\\OUT）");
     LogLine("  --no-cds-test       不执行 CDS_TEST 只读模式探测");
+    LogLine("  --no-event-log      不写精简事件日志 OUT\\events.log（默认写：一行一次实际变化）");
     LogLine("  --verbose           输出更详细的信息");
     LogLine("");
     LogLine("ensure 专有:");
@@ -960,6 +961,8 @@ int main(int, char**) {
             report.opt.settleMs = ToInt(argv[++i], 800);
         } else if (a == L"--no-cds-test") {
             report.opt.cdsTest = false;
+        } else if (a == L"--no-event-log") {
+            report.opt.eventLog = false;
         } else if (a == L"--yes" || a == L"-y") {
             report.opt.confirmed = true;
         } else if (a == L"--promote") {

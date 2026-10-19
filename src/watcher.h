@@ -50,6 +50,9 @@ private:
     bool limitWarned_ = false;
     UINT64 lastGuardMs_ = 0;      // 上次守卫动作时间，用于冷却
     int guardActionCount_ = 0;
+
+    // 精简事件日志（OUT\events.log）路径；空串表示本次运行不写
+    std::wstring eventLogPath_;
 };
 
 }  // namespace resprobe

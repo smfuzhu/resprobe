@@ -19,6 +19,22 @@
 
 namespace resprobe {
 
+// 托盘图标的三种形态，资源 ID 见 res/resprobe.rc（1=默认, 2=绿, 3=蓝）。
+//
+// 取值优先级（UpdateTrayIcon）：
+//   1) Windows 已关闭显示输出（GUID_CONSOLE_DISPLAY_STATE = Off） -> DisplayOff（蓝）
+//      放在第一位：这是操作系统层面的事实，比"显示器在不在"更能解释"屏幕为什么黑"。
+//   2) 仍有物理显示器挂在线上（活动输出带 EDID 且设备节点在）      -> MonitorOnline（绿）
+//   3) 其余情况                                                   -> Default（原图标）
+//
+// 注意第 2 条的判据是 healthyPhysical：它同时要求 EDID 可读 + 监视器设备节点存在，
+// 与 verify.cpp 的 IsLinkHealthy 同源，避免"虚拟屏兜底中"被误当成"显示器在线"。
+enum class TrayIconState {
+    Default = 0,
+    MonitorOnline,
+    DisplayOff,
+};
+
 class TrayIcon {
 public:
     TrayIcon();
@@ -49,6 +65,13 @@ private:
     void RemoveNotificationIcon();
     void SetTip(const std::wstring& tip);
 
+    // 依据 status_ 与 powerState_ 决定用哪套图标，只在形态真的变化时才
+    // Shell_NotifyIconW(NIM_MODIFY)（无谓的调用会让任务栏图标闪烁）。
+    void UpdateTrayIcon();
+
+    // GUID_CONSOLE_DISPLAY_STATE 通知：WM_POWERBROADCAST / PBT_POWERSETTINGCHANGE
+    void OnPowerSetting(WPARAM wp, LPARAM lp);
+
     // 缓存：避免每次右键都做完整探测（EDID 走 SetupAPI，有毫秒级成本）
     void RefreshStatusCache(bool force);
     void RefreshModeCache(bool force);
@@ -72,7 +95,13 @@ private:
 
     HWND hwnd_ = nullptr;
     HINSTANCE inst_ = nullptr;
-    HICON icon_ = nullptr;
+    HICON icon_ = nullptr;          // 默认（resprobe.rc ID 1）
+    HICON iconGreen_ = nullptr;     // 显示器在线（ID 2）
+    HICON iconBlue_ = nullptr;      // 显示输出已关闭（ID 3）
+    HPOWERNOTIFY powerNotify_ = nullptr;
+    DisplayPowerState powerState_ = DisplayPowerState::Unknown;
+    TrayIconState iconState_ = TrayIconState::Default;
+    UINT_PTR refreshTimerId_ = 0;
     bool iconInstalled_ = false;
     UINT taskbarCreatedMsg_ = 0;
     NOTIFYICONDATAW nid_{};

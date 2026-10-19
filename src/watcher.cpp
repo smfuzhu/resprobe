@@ -62,7 +62,13 @@ bool StopRequested() {
 }
 
 // ---------------------------------------------------------------------------
-Watcher::Watcher(Report& report) : report_(report) {}
+Watcher::Watcher(Report& report) : report_(report) {
+    // 精简事件日志在监听类子命令（watch / tray）下才写；snapshot 这类一次性
+    // 命令不产生"变动"，写它只会得到一行无意义的基线。
+    if (report_.opt.eventLog) {
+        eventLogPath_ = DefaultEventLogPath();
+    }
+}
 
 Watcher::~Watcher() {
     DestroyHostWindow();
@@ -299,6 +305,17 @@ void Watcher::TakeSample(const std::string& trigger) {
 
     ev.index = (int)report_.events.size() + 1;
 
+    // 精简事件日志：只记"实际变化"，一行一条。
+    // 有上一份快照时输出摘要版（聚合后只说"变了什么"）；没有（理论上只有首帧
+    // 会走到）或摘要不出条目时，回退到逐字段差分，避免漏记。
+    // 逐字段的完整差分仍保留在详细日志与 JSON 报告里，信息不会丢。
+    if (!eventLogPath_.empty()) {
+        std::wstring line = hasLast_ ? SummarizeEventLogLine(last_, snap, ev)
+                                     : std::wstring();
+        if (line.empty()) line = FormatEventLogLine(ev);
+        if (!line.empty()) AppendEventLogLine(eventLogPath_, W2U8(line));
+    }
+
     // 只保留有实际变化的事件；同时对超长监听设置上限，避免报告无限增长。
     // 达到上限后不再追加，而是持续用最新状态覆盖最后一条“尾事件”，
     // 这样既有界，又保证最终状态准确。
@@ -373,6 +390,15 @@ void Watcher::TakeSample(const std::string& trigger) {
             report_.actionLog.push_back("guard#" + std::to_string(guardActionCount_) +
                                         ": " + W2U8(po.message));
 
+            // 守卫动作本身就是一次"变动"，且紧随其后的快照差分要等 settle 才
+            // 采得到，先在这里落一条，避免"变了但没记上"的空档。
+            if (!eventLogPath_.empty()) {
+                AppendEventLogLine(eventLogPath_,
+                                   LocalStampText() + " [守卫] #" +
+                                   std::to_string(guardActionCount_) + " 接管: " +
+                                   W2U8(po.message));
+            }
+
             DisplaySnapshot fixed = CaptureSnapshot("guard-promoted",
                                                     report_.opt.referenceWidth,
                                                     report_.opt.referenceHeight);
@@ -413,6 +439,24 @@ int Watcher::Run() {
         ev.changedFields.push_back("initial");
         ev.snapshot = snap;
         report_.events.push_back(ev);
+
+        // events.log 的第一行是"锚点"：不带当前状态的话，后面每一行变化都
+        // 没有参照（"OFF -> ON" 里的 OFF 是从哪来的就说不清）。
+        {
+            const long active = (long)std::count_if(
+                snap.targets.begin(), snap.targets.end(),
+                [](const DisplayTarget& t) { return t.active; });
+            ev.transitions.back() =
+                "基线: 主输出 " + W2U8(snap.primaryMode) + " (" +
+                W2U8(snap.primaryGdiDevice) + "), 活动 " + std::to_string(active) +
+                "/连接 " + std::to_string((long)snap.targets.size()) + ", 电源 " +
+                W2U8(DisplayPowerStateName(snap.powerState)) + "(推断 " +
+                W2U8(DisplayPowerStateName(snap.powerStateInferred)) + ")";
+            if (!eventLogPath_.empty()) {
+                const std::wstring line = FormatEventLogLine(ev);
+                if (!line.empty()) AppendEventLogLine(eventLogPath_, W2U8(line));
+            }
+        }
     }
 
     LogLine("监听已启动。请在监听期间复现问题（关闭显示器 / 连接远程软件）。按 Ctrl+C 结束。");

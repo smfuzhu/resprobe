@@ -73,6 +73,16 @@ std::string LocalTimeText() {
     return std::string(buf);
 }
 
+// 带日期的本地时间戳，用于跨天/跨会话也能直接读的日志（events.log）
+std::string LocalStampText() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char buf[64];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%04d-%02d-%02d %02d:%02d:%02d",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return std::string(buf);
+}
+
 // ---------------------------------------------------------------------------
 // 字符串
 // ---------------------------------------------------------------------------
