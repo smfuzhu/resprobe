@@ -838,6 +838,40 @@ DisplayConfig 目标共用同一个 GDI 源名，同名下可能同时挂着物�
 | 服务枚举（`session.cpp`） | `EnumServicesStatusExW` 在缓冲区装不下剩余项时返回 `FALSE` + `ERROR_MORE_DATA`。只看一次返回值会**整类漏检**远程软件的服务痕迹 | 按 `resume` 续枚举；`needed > buf.size()` 时扩容；64 轮上限防死循环 |
 | 客户端地址（`session.cpp`） | `WTS_CLIENT_ADDRESS::Address[]` 中 IPv4 的起始偏移存在两种说法（"地址族 2 字节后紧跟 IP" vs "完整 `sockaddr_in`"），代码与注释曾经互相矛盾 | 偏移集中为唯一常量 `kInetAddrOffset`（当前 = 2），注释与实现一致；全 0 时显示 `(未提供)` 而不是 `0.0.0.0`。**若真实 RDP 会话里看到前三段像端口号，把该常量改成 4**（见 §8.7） |
 
+#### 4.8.16 隐私屏的生命周期兜底（锁屏 / 休眠 / 注销自动撤罩）
+
+隐私屏生效期间本地键鼠被吞，撤销途径只有三条：托盘菜单、连点 20 下（刻意不写进界面文案的
+彩蛋）、进程退出。于是下面三个时刻会造出"用户看不了也动不了，而且没有线索"的状态：
+
+| 时刻 | 现象 |
+|---|---|
+| 空闲休眠 → 唤醒 | 遮罩还在、钩子还在 → 黑屏且键鼠无响应，形同死机 |
+| `Win+L` → 输密码解锁 | 安全桌面拦不住也管不到钩子；登录成功回到用户桌面，迎面仍是黑屏 |
+| 注销 / 关机 | 进程本来会被强杀，但被强杀前那几秒仍可能在吞本地输入 |
+
+`TrayIcon::StopPrivacyForLifecycle(reason)` 在这三处主动 `privacy_.Stop()`：
+
+| 消息 | 处理 |
+|---|---|
+| `WM_WTSSESSION_CHANGE`（`WTS_SESSION_LOCK` / `WTS_SESSION_LOGOFF`）| 撤罩 |
+| `WM_POWERBROADCAST`（`PBT_APMSUSPEND`）| 撤罩，并返回 `TRUE`（不回 `TRUE` 就拿不到 `PBT_APMRESUMESUSPEND`）|
+| `WM_ENDSESSION` | 撤罩（顺带摘托盘图标）|
+| `WTS_SESSION_UNLOCK` / `PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND` | 强制重判状态缓存，**不重开** |
+
+三条约束：
+
+1. **只撤除，不恢复。** 隐私屏是用户的显式意图，系统替用户重开会让解锁后的画面突然变黑，更像故障。
+2. **不弹窗。** 这几条路径上用户多半看不到窗口（休眠中 / 锁屏界面 / 另一会话），且挂起只给约 2 秒，
+   所以是"静默撤罩 + 落日志"。
+3. **会话通知必须由托盘自己注册一份。** WTS 通知投递给"注册它的那个窗口"，`watcher.cpp` 现有的
+   `WTSRegisterSessionNotification` 只覆盖 Watcher 的窗口，托盘窗口收不到 —— 与
+   `RegisterPowerSettingNotification` 的情况完全相同（见 `TrayIcon::Create()` 里的注释）。
+   注册失败只降级为"锁屏时不自动撤罩"，隐私屏本身仍可用。
+
+验证（人工，无法脚本化）：开隐私屏 → `Win+L` → 输密码解锁 → 屏幕应已恢复，
+`OUT\tray.log` 应有 `[隐私屏] 已自动撤除（会话锁定）`；再开一次 → 让机器休眠 → 唤醒 → 同上
+（原因记为"系统进入睡眠"）。见 §7.6 第 12 条。
+
 ---
 
 ## 5. 关键配置项
@@ -1480,6 +1514,7 @@ resprobe.exe verify --peer samples\peer-degraded-1024x768.json
 | 9 | 双击 `resprobe.exe`（托盘）后从菜单退出 | 日志尾部有 `ResProbe 托盘已退出。`，且**不残留进程** | 托盘创建/回收、图标摘除 |
 | 10 | `powershell -NoProfile -ExecutionPolicy Bypass -File 脚本编码修复.ps1` | 退出码 `0` | `.cmd` / `.bat` 纯 ASCII |
 | 11 | `powershell -NoProfile -ExecutionPolicy Bypass -File res\check-manifest.ps1` | 退出码 `0` | manifest 合法性（改过 manifest 必跑）|
+| 12 | 开隐私屏 → `Win+L` → 输密码解锁（或：开隐私屏 → 休眠 → 唤醒）| 屏幕已恢复、本地键鼠可用；`OUT\tray.log` 有 `[隐私屏] 已自动撤除（会话锁定）` / `（系统进入睡眠）`，且**不会**自动重开 | 隐私屏生命周期兜底（§4.8.16）|
 
 > 第 7、8 条是**反向用例**（专门验证失败路径的语义），建议保留：正向用例通过并不代表失败
 > 路径正确 —— 本轮修的 `WriteOutputs` 退出码与 `RestoreReferenceMode` 归因这两个缺陷，
@@ -2165,6 +2200,7 @@ JSON 字段（见 `samples/peer-*.json`）：`tool`、`version`、`generatedUtc`
 | 2026-10-09 | 修复 | 见 §4.8.7–§4.8.12 | **第 1 轮代码审查修复（15 项）**：失败归因四分类（H2）／跨进程守卫与托盘双互锁（H3）／托盘落盘日志（M1）／角色标记读取方向 `keepHead`（M4）／超时终止整棵进程树（M5）／状态查询收敛为单轮枚举（M6）／更名与校验类 L 项若干。详见 §4.8.7–§4.8.12 与 §14.4 |
 | 2026-10-09 | 修复 | verify / display / edid / session / main / watcher | **第 2 轮代码审查修复（10 项：H-1~H-4、M-1~M-6）**，实测证据见 §10.4，逐项说明见 §14.3 |
 | 2026-10-09 | 文档 / 构建 | 仓库根 | 新增 `README.md`（使用者 + 贡献者入口）与 `.gitignore`（首次提交前必需）；本文档补齐 §7.5 / §7.6 / §9.7 / §10.4 / §11 术语表 / §12 代码规范 / §13 数据模型 / §14 版本更新记录，并把 §8.5 与 §8.6 的错序调整为正序 |
+| 2026-10-20 | 新增 | `tray` | **隐私屏生命周期兜底**：`WTS_SESSION_LOCK` / `LOGOFF`、`PBT_APMSUSPEND`、`WM_ENDSESSION` 时自动撤罩；`WTS_SESSION_UNLOCK` / `PBT_APMRESUME*` 只重判状态、不重开。托盘自己注册 `WTSRegisterSessionNotification`（原先只有 Watcher 注册，消息到不了托盘窗口）。动机：开着隐私屏休眠或 `Win+L` 后回来是"黑屏 + 键鼠无响应"，比不开更糟。详见 §4.8.16，人工验证见 §7.6 第 12 条 |
 
 ### 14.3 详细记录：第 2 轮（2026-10-09）
 

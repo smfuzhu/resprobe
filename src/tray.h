@@ -97,6 +97,16 @@ private:
     // 菜单开关。实际实现委托给 PrivacyScreen（全屏遮罩 + 捕获排除 + 吞物理键鼠）。
     void TogglePrivacyScreen();
 
+    // 隐私屏的"生命周期兜底"：会话锁定 / 系统休眠 / 注销时**主动撤除**遮罩。
+    //
+    // 为什么必须有：隐私屏生效期间本地键鼠被吞，撤销途径只有菜单、连点 20 下、
+    // 进程退出三条。若这时系统空闲休眠或用户按了 Win+L，回来面对的是
+    // "全黑 + 键鼠无响应"，看起来就是死机（连点那条是彩蛋，不能指望用户记得）。
+    //
+    // 语义：**只撤除，不恢复**。隐私屏是显式意图，系统替用户重开比不重开更糟
+    //       （解锁后画面突然变黑，用户会当成故障）。
+    void StopPrivacyForLifecycle(const char* reason);
+
     // GUID_CONSOLE_DISPLAY_STATE 通知：WM_POWERBROADCAST / PBT_POWERSETTINGCHANGE
     void OnPowerSetting(WPARAM wp, LPARAM lp);
 
@@ -137,6 +147,9 @@ private:
     // 与第 6 态图标的唯一依据 —— 不再有"意图标志 / 实际状态"两套状态。
     PrivacyScreen privacy_;
     bool iconInstalled_ = false;
+    // 会话通知（WM_WTSSESSION_CHANGE）是否注册成功。通知投递给"注册它的那个窗口"，
+    // Watcher 的注册只覆盖它自己的窗口，所以托盘必须自己再注册一份。
+    bool wtsRegistered_ = false;
     UINT taskbarCreatedMsg_ = 0;
     NOTIFYICONDATAW nid_{};
     std::wstring lastTip_;          // 上次下发的提示文本，用于避免重复 NIM_MODIFY

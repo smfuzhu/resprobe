@@ -5,6 +5,8 @@
 #include "util.h"
 #include "watcher.h"   // RequestStop：菜单里"退出"复用 Ctrl+C 的停机路径
 
+#include <wtsapi32.h>  // WM_WTSSESSION_CHANGE / WTS_SESSION_LOCK（隐私屏生命周期兜底）
+
 #include <cstdio>
 
 namespace resprobe {
@@ -123,6 +125,14 @@ bool TrayIcon::Create(UINT32 refW, UINT32 refH) {
     LogLine("[托盘] 显示器电源状态通知注册" +
             std::string(powerNotify_ ? "成功" : "失败（图标不区分显示输出关闭）"));
 
+    // 会话通知（锁屏/解锁/注销）：同样必须由托盘自己注册一份，理由与上面相同 ——
+    // Watcher 的 WTSRegisterSessionNotification 只把消息投递给它自己的窗口。
+    // 用途是隐私屏的生命周期兜底（见 StopPrivacyForLifecycle）。
+    // 注册失败不致命：只是失去"锁屏时自动撤罩"，隐私屏本身仍可用。
+    wtsRegistered_ = (WTSRegisterSessionNotification(hwnd_, NOTIFY_FOR_THIS_SESSION) != FALSE);
+    LogLine("[托盘] 会话通知注册" +
+            std::string(wtsRegistered_ ? "成功" : "失败（锁屏时不会自动撤除隐私屏）"));
+
     AddNotificationIcon();
 
     // 图标注册失败（例如 explorer.exe 未运行）时必须让调用方知道。
@@ -153,6 +163,10 @@ void TrayIcon::Destroy() {
     if (powerNotify_) {
         UnregisterPowerSettingNotification(powerNotify_);
         powerNotify_ = nullptr;
+    }
+    if (hwnd_ && wtsRegistered_) {
+        WTSUnRegisterSessionNotification(hwnd_);
+        wtsRegistered_ = false;
     }
     if (hwnd_ && refreshTimerId_) {
         KillTimer(hwnd_, refreshTimerId_);
@@ -357,6 +371,34 @@ void TrayIcon::TogglePrivacyScreen() {
 }
 
 // ---------------------------------------------------------------------------
+// 隐私屏的生命周期兜底：锁屏 / 休眠 / 注销时主动撤罩
+// ---------------------------------------------------------------------------
+// 这里的每一条都是真机场景，不是防御性编程：
+//
+//   * 空闲休眠：开着隐私屏走开，系统按电源计划休眠；唤醒后遮罩还在、键鼠还在被吞，
+//     本地看起来就是"黑屏死机"。而连点 20 下这条逃生路径**刻意没写进界面文案**
+//     （见 TogglePrivacyScreen 末尾注释），所以不能指望用户记得。
+//   * Win+L：登录界面属于安全桌面，钩子拦不住也管不到；用户输完密码回到用户桌面，
+//     迎接他的是同一块黑屏 —— 能登录、不能用，比进不去更让人以为机器坏了。
+//   * 注销 / 关机：进程会被强杀，遮罩本身随进程消失，但仍先主动撤一次，
+//     保证"进程还活着的这段时间"里不会再吞输入。
+//
+// 三条语义约束：
+//   1) **只撤除，不恢复**。隐私屏是用户的显式意图，系统替用户重开比不重开更糟。
+//   2) **不弹窗**。这三条路径上用户多半看不到窗口（休眠中 / 锁屏界面 / 另一会话），
+//      而且 PBT_APMSUSPEND 只给约 2 秒，弹模态框会拖住挂起流程。
+//   3) 撤除后立刻重判图标：第 6 态（紫）的唯一依据是 privacy_.Active()，
+//      不重判会留下"屏幕亮着却显示隐私屏中"的谎报。
+void TrayIcon::StopPrivacyForLifecycle(const char* reason) {
+    if (!privacy_.Active()) return;
+    privacy_.Stop();
+    LogLine(std::string("[隐私屏] 已自动撤除（") + reason +
+            "）：遮罩移除，本地键鼠恢复；不会自动重新开启");
+    UpdateTrayIcon();
+    RefreshTip();
+}
+
+// ---------------------------------------------------------------------------
 void TrayIcon::RefreshTip() {
     if (!iconInstalled_) return;
 
@@ -462,7 +504,39 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 OnPowerSetting(wp, lp);
                 return TRUE;
             }
+            if (wp == PBT_APMSUSPEND) {
+                // 挂起前把遮罩撤掉：否则唤醒后是"黑屏 + 键鼠无响应"。
+                // Stop() 是同步的 DestroyWindow + UnhookWindowsHookEx，这里来得及。
+                StopPrivacyForLifecycle("系统进入睡眠");
+                return TRUE;   // 必须回 TRUE，系统才会在恢复时发 PBT_APMRESUMESUSPEND
+            }
+            if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
+                // 恢复后不重开隐私屏（见 StopPrivacyForLifecycle 的语义约束 1），
+                // 但拓扑与电源状态大概率已经变了，强制重判一次图标。
+                RefreshStatusCache(true);
+                return TRUE;
+            }
             break;
+
+        case WM_WTSSESSION_CHANGE:
+            // 通知投递给"注册它的窗口"，所以这条分支只有在托盘自己注册成功时才会到
+            // （见 Create 里的 WTSRegisterSessionNotification）。
+            switch (wp) {
+                case WTS_SESSION_LOCK:
+                    // Win+L / 空闲锁屏：解锁后能登录却不能用，必须撤罩。
+                    StopPrivacyForLifecycle("会话锁定");
+                    return 0;
+                case WTS_SESSION_LOGOFF:
+                    StopPrivacyForLifecycle("会话注销");
+                    return 0;
+                case WTS_SESSION_UNLOCK:
+                    // 解锁后不重开，但屏幕刚恢复，缓存的状态多半已过期
+                    RefreshStatusCache(true);
+                    return 0;
+                default:
+                    // 远程连接/断开等：隐私屏不关心，交给 watcher 记录
+                    return 0;
+            }
 
         case kTrayPrivacyTapMsg:
             // 连点 20 下（10 秒内）：钩子只负责投递，这里在主线程真正执行。
@@ -489,7 +563,10 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_ENDSESSION:
-            // 注销/关机时立刻摘掉图标，避免留下"幽灵图标"
+            // 注销/关机：遮罩窗口本来会随进程消失，但进程被强杀前可能还有几秒，
+            // 期间不该继续吞本地输入。顺手撤一次，代价为零。
+            StopPrivacyForLifecycle("注销或关机");
+            // 立刻摘掉图标，避免留下"幽灵图标"
             RemoveNotificationIcon();
             return 0;
 
