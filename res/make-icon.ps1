@@ -1,12 +1,20 @@
 # ===========================================================================
 #  ResProbe - icon generator
 #
-#  Produces five variants of the tray icon:
-#      res\resprobe.ico        default   (screen: cyan -> deep blue gradient)
-#      res\resprobe-green.ico  monitor online          (screen: light -> deep green)
-#      res\resprobe-blue.ico   display output off      (screen: dim solid blue)
-#      res\resprobe-red.ico    no fallback available   (screen: light -> deep red)
-#      res\resprobe-yellow.ico fallback active         (screen: light -> deep amber)
+#  Produces six variants of the tray icon:
+#      res\resprobe.ico         default   (screen: cyan -> deep blue gradient)
+#      res\resprobe-green.ico   monitor online          (screen: light -> deep green)
+#      res\resprobe-blue.ico    display output off      (screen: dim solid blue)
+#      res\resprobe-red.ico     no fallback available   (screen: light -> deep red)
+#      res\resprobe-yellow.ico  fallback active         (screen: light -> deep amber)
+#      res\resprobe-privacy.ico privacy screen          (violet screen + closed-eye bar)
+#
+#  WHY THE PRIVACY ICON USES A SHAPE, NOT JUST A SIXTH COLOUR
+#    Six hues are already past what stays distinguishable in a 16x16 tray icon
+#    (the default is a cyan->blue gradient and "display off" is a dark blue, which
+#    are close to begin with). The privacy variant therefore carries a horizontal
+#    "closed eye" bar across the screen - a shape survives downscaling far better
+#    than hue does. The violet field is only a secondary cue.
 #
 #  The three files are committed to the repository so the build does NOT
 #  require this script; it only needs to be re-run when the artwork changes:
@@ -62,7 +70,8 @@ function New-RoundedPath {
 function New-IconBitmap {
     param([int]$S,
           [System.Drawing.Color]$Screen,
-          [System.Drawing.Color]$Deep)
+          [System.Drawing.Color]$Deep,
+          [switch]$Privacy)
 
     $bmp = New-Object System.Drawing.Bitmap($S, $S, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g   = [System.Drawing.Graphics]::FromImage($bmp)
@@ -98,6 +107,19 @@ function New-IconBitmap {
         $g.FillPath($grad, $screenPath)
         $screenPath.Dispose()
         $grad.Dispose()
+    }
+
+    # ---- closed-eye bar (privacy screen only) ---------------------------------
+    # 只在这一套上画：隐私屏在 16x16 下必须靠形状才能和其余五态可靠区分。
+    if ($Privacy -and $sw -gt 0.5 -and $sh -gt 0.5) {
+        $barH = [Math]::Max(1.5, $sh * 0.30)
+        $barY = $sy + ($sh - $barH) / 2.0
+        $barBrush = New-Object System.Drawing.SolidBrush(
+                        [System.Drawing.Color]::FromArgb(255, 235, 225, 255))
+        $barPath = New-RoundedPath $sx $barY $sw $barH ([Math]::Max(0.5, $barH / 2.0))
+        $g.FillPath($barBrush, $barPath)
+        $barPath.Dispose()
+        $barBrush.Dispose()
     }
 
     # ---- stand -------------------------------------------------------------
@@ -180,11 +202,16 @@ function Get-PngBytes {
 function Write-IconFile {
     param([string]$Path,
           [System.Drawing.Color]$Screen,
-          [System.Drawing.Color]$Deep)
+          [System.Drawing.Color]$Deep,
+          [switch]$Privacy)
 
     $entries = @()
     foreach ($s in $sizes) {
-        $bmp = New-IconBitmap $s $Screen $Deep
+        if ($Privacy) {
+            $bmp = New-IconBitmap $s $Screen $Deep -Privacy
+        } else {
+            $bmp = New-IconBitmap $s $Screen $Deep
+        }
         if ($s -ge $pngFrom) {
             $bytes = Get-PngBytes $bmp
             $kind  = 'PNG'
@@ -265,12 +292,22 @@ $palettes = @(
         Deep   = [System.Drawing.Color]::FromArgb(255, 180,  35,  24)   # deep red
     },
     [pscustomobject]@{
-        File   = 'resprobe-yellow.ico'
-        Screen = [System.Drawing.Color]::FromArgb(255, 255, 214, 102)   # light amber
-        Deep   = [System.Drawing.Color]::FromArgb(255, 199, 126,  10)   # deep amber
+        File    = 'resprobe-yellow.ico'
+        Screen  = [System.Drawing.Color]::FromArgb(255, 255, 214, 102)   # light amber
+        Deep    = [System.Drawing.Color]::FromArgb(255, 199, 126,  10)   # deep amber
+    },
+    [pscustomobject]@{
+        File    = 'resprobe-privacy.ico'
+        Screen  = [System.Drawing.Color]::FromArgb(255, 167, 139, 250)   # violet
+        Deep    = [System.Drawing.Color]::FromArgb(255, 109,  40, 217)   # deep violet
+        Privacy = $true
     }
 )
 
 foreach ($p in $palettes) {
-    Write-IconFile -Path (Join-Path $PSScriptRoot $p.File) -Screen $p.Screen -Deep $p.Deep
+    if ($p.Privacy) {
+        Write-IconFile -Path (Join-Path $PSScriptRoot $p.File) -Screen $p.Screen -Deep $p.Deep -Privacy
+    } else {
+        Write-IconFile -Path (Join-Path $PSScriptRoot $p.File) -Screen $p.Screen -Deep $p.Deep
+    }
 }

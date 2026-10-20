@@ -26,12 +26,12 @@ DEPS     := $(OBJS:.o=.d)
 
 # 资源对象: 图标 + manifest(requireAdministrator/DPI) + 版本信息
 RCOBJ    := $(BUILDDIR)/res.o
-# 五套托盘图标（默认 / 在线-绿 / 显示输出已关闭-蓝 / 无兜底-红 / 兜底中-黄），
-# 任一变化都要重新 windres
+# 六套托盘图标（默认 / 在线-绿 / 显示输出已关闭-蓝 / 无兜底-红 / 兜底中-黄 /
+# 隐私屏-紫底横条），任一变化都要重新 windres
 RC_SRCS  := $(RESDIR)/resprobe.rc $(RESDIR)/resprobe.manifest \
             $(RESDIR)/resprobe.ico $(RESDIR)/resprobe-green.ico \
             $(RESDIR)/resprobe-blue.ico $(RESDIR)/resprobe-red.ico \
-            $(RESDIR)/resprobe-yellow.ico
+            $(RESDIR)/resprobe-yellow.ico $(RESDIR)/resprobe-privacy.ico
 
 .PHONY: all clean run icon test
 

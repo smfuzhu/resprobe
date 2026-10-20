@@ -513,6 +513,34 @@ bool EnsureOutDir() {
     return EnsureDirectoryExists(GetOutDirPath());
 }
 
+// ---------------------------------------------------------------------------
+// 关闭 / 恢复显示输出
+// ---------------------------------------------------------------------------
+namespace {
+
+// 用 SendMessageTimeout 而不是 SendMessage：目标是 HWND_BROADCAST，
+// 只要有一个窗口不响应广播，SendMessage 就会把本进程挂死。
+// SMTO_ABORTIFHUNG 让不响应的窗口被跳过，1 秒超时足够。
+bool BroadcastMonitorPower(LPARAM mode) {
+    DWORD_PTR ignored = 0;
+    const LRESULT r = SendMessageTimeoutW(
+        (HWND)HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, mode,
+        SMTO_NORMAL | SMTO_ABORTIFHUNG, 1000, &ignored);
+    return r != 0;
+}
+
+}  // namespace
+
+bool RequestDisplayOutputOff() {
+    // lParam = 2 -> "the display is being shut off"
+    return BroadcastMonitorPower((LPARAM)2);
+}
+
+bool RequestDisplayOutputOn() {
+    // lParam = -1 -> "the display is being turned on"
+    return BroadcastMonitorPower((LPARAM)-1);
+}
+
 bool RedirectStdioToLog(const std::wstring& logName, std::wstring* pathOut) {
     if (logName.empty()) return false;
 

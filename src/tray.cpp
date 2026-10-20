@@ -22,14 +22,21 @@ const int kIconGreenResourceId = 2;   // resprobe-green.ico  显示器在线
 const int kIconBlueResourceId  = 3;   // resprobe-blue.ico   显示输出已关闭
 const int kIconRedResourceId   = 4;   // resprobe-red.ico    无兜底
 const int kIconYellowResourceId= 5;   // resprobe-yellow.ico 兜底中
+const int kIconPrivacyResourceId = 6; // resprobe-privacy.ico 隐私屏（紫底 + 闭眼横条）
 
-// 五种形态在托盘提示里的后缀（与图标一一对应，鼠标悬停时给一层文字确认）
+// 隐私屏确认等待：请求关闭显示输出后，最多等这么久收 =OFF 电源通知。
+// 超时即认为系统拒绝了这个请求（独占全屏应用、投影演示模式等）。
+const UINT_PTR kPrivacyTimerId = 3;
+const UINT kPrivacyConfirmMs = 1500;
+
+// 六种形态在托盘提示里的后缀（与图标一一对应，鼠标悬停时给一层文字确认）
 const wchar_t* TrayStateSuffix(TrayIconState s) {
     switch (s) {
         case TrayIconState::MonitorOnline:  return L" · 显示器在线";
         case TrayIconState::DisplayOff:     return L" · 显示输出已关闭";
         case TrayIconState::FallbackActive: return L" · 兜底中";
         case TrayIconState::NoFallback:     return L" · 无兜底";
+        case TrayIconState::PrivacyScreen:  return L" · 隐私屏中";
         default:                            return L"";
     }
 }
@@ -59,6 +66,7 @@ enum MenuId : int {
     kIdAutoOnce      = 1302,
     kIdAutoOff       = 1303,
     kIdAutoStatus    = 1304,
+    kIdPrivacy       = 1305,
 
     kIdInstall       = 1401,
     kIdUninstall     = 1402,
@@ -99,12 +107,14 @@ bool TrayIcon::Create(UINT32 refW, UINT32 refH) {
     iconBlue_  = LoadIconW(inst_, MAKEINTRESOURCEW(kIconBlueResourceId));
     iconRed_   = LoadIconW(inst_, MAKEINTRESOURCEW(kIconRedResourceId));
     iconYellow_= LoadIconW(inst_, MAKEINTRESOURCEW(kIconYellowResourceId));
+    iconPrivacy_ = LoadIconW(inst_, MAKEINTRESOURCEW(kIconPrivacyResourceId));
 
     LogLine("[托盘] 图标资源: 默认=" + std::string(icon_ ? "OK" : "缺失") +
             " 绿(在线)=" + std::string(iconGreen_ ? "OK" : "缺失") +
             " 蓝(显示输出已关闭)=" + std::string(iconBlue_ ? "OK" : "缺失") +
             " 红(无兜底)=" + std::string(iconRed_ ? "OK" : "缺失") +
-            " 黄(兜底中)=" + std::string(iconYellow_ ? "OK" : "缺失"));
+            " 黄(兜底中)=" + std::string(iconYellow_ ? "OK" : "缺失") +
+            " 紫(隐私屏)=" + std::string(iconPrivacy_ ? "OK" : "缺失"));
 
     // 显示器电源状态（开/关/低功耗）。
     //
@@ -146,6 +156,18 @@ void TrayIcon::Destroy() {
     if (hwnd_ && refreshTimerId_) {
         KillTimer(hwnd_, refreshTimerId_);
         refreshTimerId_ = 0;
+    }
+    if (hwnd_ && privacyTimerId_) {
+        KillTimer(hwnd_, privacyTimerId_);
+        privacyTimerId_ = 0;
+    }
+    // 退出前若隐私屏还开着，把显示输出恢复回去。否则用户回来面对的是一片黑，
+    // 且没有任何线索说明是谁干的（隐私意图只在本进程的内存里）。
+    if (privacyArmed_ || privacyPending_) {
+        LogLine("[托盘] 隐私屏 -> 进程退出，恢复显示输出");
+        RequestDisplayOutputOn();
+        privacyArmed_ = false;
+        privacyPending_ = false;
     }
     RemoveNotificationIcon();
     if (hwnd_) {
@@ -220,6 +242,13 @@ void TrayIcon::RefreshStatusCache(bool force) {
     status_ = QueryTrayStatus(refW_, refH_);
     statusStampMs_ = now;
 
+    // 隐私屏的前提是"有物理屏可遮"。物理屏不在了（EDID 与设备节点都读不到），
+    // 隐私就失去意义，此时解除意图，避免菜单文案与实际情况脱节。
+    // 只解除意图，不擅自发"恢复显示输出"——屏幕本来就是黑的，别去点亮它。
+    if (privacyArmed_ && status_.healthyPhysical <= 0) {
+        CancelPrivacyScreen("物理屏已不在线");
+    }
+
     // 状态刚刷新完，同步一次图标与提示（显示器在线与否只存在于这份探测结果里）
     UpdateTrayIcon();
     RefreshTip();
@@ -256,7 +285,13 @@ TrayIconState DecideTrayIconState(const TrayStatus& st, DisplayPowerState power)
 void TrayIcon::UpdateTrayIcon() {
     if (!iconInstalled_) return;
 
-    const TrayIconState want = DecideTrayIconState(status_, powerState_);
+    // 隐私屏是用户主动发起的覆盖项，但它只在"显示输出确实已关闭"时才显示紫色：
+    // 屏幕被本地输入唤醒后，图标必须回到真实状态（绿/黄/红/蓝），
+    // 否则会出现"屏幕亮着却显示隐私屏中"的谎报。意图本身由菜单文案承载。
+    const TrayIconState want =
+        (privacyArmed_ && powerState_ == DisplayPowerState::Off)
+            ? TrayIconState::PrivacyScreen
+            : DecideTrayIconState(status_, powerState_);
 
     if (want == iconState_) return;
 
@@ -269,6 +304,8 @@ void TrayIcon::UpdateTrayIcon() {
         h = iconYellow_ ? iconYellow_ : icon_;
     } else if (want == TrayIconState::NoFallback) {
         h = iconRed_ ? iconRed_ : icon_;
+    } else if (want == TrayIconState::PrivacyScreen) {
+        h = iconPrivacy_ ? iconPrivacy_ : icon_;
     }
     if (!h) return;
 
@@ -281,11 +318,86 @@ void TrayIcon::UpdateTrayIcon() {
                      : (want == TrayIconState::DisplayOff)     ? "蓝(显示输出已关闭)"
                      : (want == TrayIconState::FallbackActive) ? "黄(兜底中)"
                      : (want == TrayIconState::NoFallback)     ? "红(无兜底)"
+                     : (want == TrayIconState::PrivacyScreen)  ? "紫(隐私屏中)"
                                                                : "默认";
     LogLine(std::string("[托盘] 图标 -> ") + name);
 
     // 图标换了，提示必须跟着换，否则悬停看到的还是旧状态
     RefreshTip();
+}
+
+// ---------------------------------------------------------------------------
+// 隐私屏
+// ---------------------------------------------------------------------------
+void TrayIcon::TogglePrivacyScreen() {
+    if (!iconInstalled_) return;
+
+    if (privacyArmed_ || privacyPending_) {
+        LogLine("[托盘] 隐私屏 -> 关闭（请求恢复显示输出）");
+        // 先解除意图，再发请求。SendMessageTimeout 到 HWND_BROADCAST 是**同步**投递的，
+        // 请求一发出去本窗口就会立刻收到 =ON；若那时意图还在，该通知会被
+        // OnPowerSetting 误记成"本地输入唤醒"，关闭原因就写错了。
+        const bool wasPending = privacyPending_;
+        privacyArmed_ = false;
+        privacyPending_ = false;
+        if (privacyTimerId_) {
+            KillTimer(hwnd_, privacyTimerId_);
+            privacyTimerId_ = 0;
+        }
+        RequestDisplayOutputOn();
+        LogLine(std::string("[托盘] 隐私屏 -> 已关闭") +
+                (wasPending ? "（关闭前请求尚未被确认）" : ""));
+        UpdateTrayIcon();
+        RefreshTip();
+        return;
+    }
+
+    if (powerState_ == DisplayPowerState::Off) {
+        // 屏幕本来就是黑的（空闲关屏等）：只置意图、不发请求。
+        // 发了也不会产生新的 =OFF 通知，反而会被确认超时误判成"请求被拒"。
+        privacyArmed_ = true;
+        LogLine("[托盘] 隐私屏 -> 开启（当前显示输出本已关闭，直接生效）");
+        UpdateTrayIcon();
+        return;
+    }
+
+    // 开启：先置意图（菜单文案立刻变成"关闭隐私屏"），再发请求
+    privacyArmed_ = true;
+    privacyPending_ = true;
+    LogLine("[托盘] 隐私屏 -> 开启（请求关闭显示输出）");
+    RequestDisplayOutputOff();
+
+    // SendMessageTimeout 到 HWND_BROADCAST 是同步投递的：请求返回时 =OFF 通知
+    // 可能已经被 OnPowerSetting 处理掉（那里会把 privacyPending_ 清掉并记"已确认"）。
+    // 所以这里只在"仍在等待"时才补确认或设定时器，避免同一条确认打印两遍。
+    if (privacyPending_ && powerState_ == DisplayPowerState::Off) {
+        privacyPending_ = false;
+        LogLine("[托盘] 隐私屏 -> 已确认（显示输出已关闭）");
+    } else if (privacyPending_) {
+        // 继续等电源通知；超时说明系统拒绝了这个请求
+        privacyTimerId_ = SetTimer(hwnd_, kPrivacyTimerId, kPrivacyConfirmMs, nullptr);
+    }
+
+    UpdateTrayIcon();
+}
+
+void TrayIcon::CancelPrivacyScreen(const char* reason) {
+    privacyArmed_ = false;
+    privacyPending_ = false;
+    if (privacyTimerId_) {
+        KillTimer(hwnd_, privacyTimerId_);
+        privacyTimerId_ = 0;
+    }
+    LogLine(std::string("[托盘] 隐私屏 -> 取消（") + reason + "）");
+    UpdateTrayIcon();
+    RefreshTip();
+}
+
+void TrayIcon::OnPrivacyConfirmTimeout() {
+    if (!privacyPending_) return;
+    // 1.5 秒内没收到 =OFF：系统拒绝了这个请求。独占全屏应用、投影演示模式、
+    // 以及某些电源策略都会导致这种情况。
+    CancelPrivacyScreen("请求未生效，系统未确认关闭显示输出");
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +427,25 @@ void TrayIcon::OnPowerSetting(WPARAM, LPARAM lp) {
                                : DisplayPowerState::Unknown;
 
     LogLine("[托盘] 电源通知(显示器状态)=" + W2U8(DisplayPowerStateName(powerState_)));
+
+    if (powerState_ == DisplayPowerState::Off) {
+        if (privacyPending_) {
+            // 我们发起的请求被接受了
+            privacyPending_ = false;
+            if (privacyTimerId_) {
+                KillTimer(hwnd_, privacyTimerId_);
+                privacyTimerId_ = 0;
+            }
+            LogLine("[托盘] 隐私屏 -> 已确认（收到电源通知 =OFF）");
+        }
+    } else if (privacyArmed_) {
+        // 显示输出又亮了（=On 或 =Dimmed）。两种可能：本地键鼠输入唤醒，或者
+        // 某个进程持着显示电源请求把屏幕要了回去（RustDesk 就会这么干，
+        // 见 powercfg /requests）——这两者从通知里分不出来，所以措辞保持中立。
+        // 按既定策略"接受该限制"，隐私屏视为一次性结束；只解除意图，不发"恢复
+        // 显示输出"（屏幕已经亮了，发了也是空操作）。
+        CancelPrivacyScreen("显示输出已恢复（本地输入唤醒，或被电源请求要回）");
+    }
 
     // 事件驱动，无需等定时器：这里直接重判一次图标
     UpdateTrayIcon();
@@ -392,6 +523,11 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RefreshStatusCache(true);
                 return 0;
             }
+            if (wp == kPrivacyTimerId) {
+                privacyTimerId_ = 0;
+                OnPrivacyConfirmTimeout();
+                return 0;
+            }
             break;
 
         case WM_CLOSE:
@@ -456,6 +592,13 @@ void TrayIcon::ShowContextMenu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kIdStatus, L"完整状态报告...");
     AppendMenuW(menu, MF_STRING, kIdPaths, L"列出显示输出路径...");
+
+    // ---- 隐私屏 -------------------------------------------------------------
+    // 文案跟随"意图"而不是"屏幕当前是否真黑"：屏幕被本地输入唤醒后意图仍在，
+    // 此时点它才是"关闭隐私屏"；否则永远只能开启，无法用菜单收尾。
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kIdPrivacy,
+                (privacyArmed_ || privacyPending_) ? L"关闭隐私屏" : L"开启隐私屏");
 
     // ---- 分辨率 -------------------------------------------------------------
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -549,6 +692,9 @@ bool TrayIcon::HandleCommand(int id) {
             return true;
         case kIdPaths:
             ActShowPaths();
+            return true;
+        case kIdPrivacy:
+            TogglePrivacyScreen();
             return true;
         case kIdOpenOut:
             // ShellExecute 会失败（资源管理器被替换、路径不存在、被策略拦截），
