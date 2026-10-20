@@ -15,6 +15,8 @@ const wchar_t kTrayClassName[] = L"ResProbeTrayHost";
 
 // 自定义回调消息：Shell_NotifyIcon 会把鼠标事件投递到这个消息上
 const UINT kTrayCallbackMsg = WM_APP + 101;
+// 连点切换请求：由 mouse hook 回调 PostMessage 过来（钩子里不能直接开关窗口）
+const UINT kTrayPrivacyTapMsg = WM_APP + 102;
 
 // 资源脚本里的图标 ID（见 res/resprobe.rc）
 const int kIconResourceId      = 1;   // resprobe.ico        默认
@@ -139,6 +141,10 @@ bool TrayIcon::Create(UINT32 refW, UINT32 refH) {
     RefreshStatusCache(true);
     RefreshModeCache(true);
     RefreshTip();
+
+    // 连点解除的通知目标。钩子本身只在隐私屏开启期间安装（见 privacy.cpp），
+    // 这里只是告诉它"数满了往哪个窗口发消息"。
+    privacy_.SetNotifyTarget(hwnd_, kTrayPrivacyTapMsg);
 
     return true;
 }
@@ -318,6 +324,9 @@ void TrayIcon::TogglePrivacyScreen() {
         LogLine("[托盘] 隐私屏 -> 已关闭（遮罩撤除，本地键鼠恢复）");
         UpdateTrayIcon();
         RefreshTip();
+        // 解除也要确认。此时遮罩已经撤掉，所以这个弹窗本地和远端都看得见。
+        Info(L"隐私屏已关闭",
+             L"本地屏幕已恢复，本地键鼠已恢复正常操作。");
         return;
     }
 
@@ -331,6 +340,20 @@ void TrayIcon::TogglePrivacyScreen() {
 
     UpdateTrayIcon();
     RefreshTip();
+
+    // 开启成功后的确认弹窗（关闭不弹，按需求）。
+    //
+    // 这个窗口是普通非置顶窗口，会被我们自己的全屏遮罩盖住 —— 于是：
+    //   * 本地看不到它（也就不会出现"本地有个点不掉的对话框"这种死结）；
+    //   * 捕获端看不到遮罩，所以远端能正常看到并点掉它。
+    // 换句话说它是给发起操作的那一端（通常是远端）看的确认。
+    // 弹窗是模态的，消息泵仍在跑，100ms 置顶定时器与连点切换都不受影响。
+    // 注意：这里只列托盘菜单一条关闭途径。连点解除是**彩蛋**，不能在界面文案里
+    // 提示出来 —— 否则等于把"本地任何人都能解除隐私屏"的方法直接告诉使用者。
+    Info(L"隐私屏已开启",
+         L"本地屏幕已变黑，本地键鼠已屏蔽；\n"
+         L"远程端仍可正常看到并操作桌面。\n\n"
+         L"如需关闭，请使用托盘菜单「关闭隐私屏」。");
 }
 
 // ---------------------------------------------------------------------------
@@ -416,14 +439,19 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case kTrayCallbackMsg: {
             switch (LOWORD(lp)) {
+                // 左键与右键都弹出菜单：左键点开更顺手，也是很多托盘程序的习惯。
+                // 状态报告仍然可以从菜单里的「完整状态报告...」打开，功能没有丢失。
+                case WM_LBUTTONUP:
                 case WM_RBUTTONUP:
                 case WM_CONTEXTMENU:
                     ShowContextMenu();
                     return 0;
-                case WM_LBUTTONUP:
+
                 case WM_LBUTTONDBLCLK:
-                    ActShowStatus();
+                    // 第一次点击已经弹出菜单，双击的第二次点击由菜单的模态循环吃掉。
+                    // 这里如果再做别的动作，会与菜单叠在一起。
                     return 0;
+
                 default:
                     return 0;
             }
@@ -435,6 +463,16 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return TRUE;
             }
             break;
+
+        case kTrayPrivacyTapMsg:
+            // 连点 20 下（10 秒内）：钩子只负责投递，这里在主线程真正执行。
+            // **单向 —— 只解除，不开启**。开启方向要靠常驻鼠标钩子，代价不值得。
+            // 消息可能在别处已经关掉隐私屏之后才被处理，所以再确认一次当前状态。
+            if (privacy_.Active()) {
+                LogLine("[隐私屏] 连点解除触发（10 秒内 20 次鼠标按下）");
+                TogglePrivacyScreen();
+            }
+            return 0;
 
         case WM_TIMER:
             if (wp == kTrayRefreshTimerId) {

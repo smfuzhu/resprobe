@@ -23,6 +23,10 @@ const UINT kTopmostIntervalMs = 100;
 // 1 = 正在吞物理键鼠。用文件级变量是因为钩子回调只能是普通函数。
 volatile LONG g_swallow = 0;
 
+// 钩子回调需要回调成员函数，而回调只能是普通函数 —— 用一个文件级指针转发。
+// 进程内只会有一个 PrivacyScreen，所以不需要更复杂的绑定方式。
+PrivacyScreen* g_owner = nullptr;
+
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode == HC_ACTION && g_swallow) {
         auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
@@ -34,9 +38,24 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
 }
 
 LRESULT CALLBACK MouseProc(int nCode, WPARAM wp, LPARAM lp) {
-    if (nCode == HC_ACTION && g_swallow) {
-        auto* m = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
-        if (m && !(m->flags & LLMHF_INJECTED)) return 1;
+    if (nCode != HC_ACTION) return CallNextHookEx(nullptr, nCode, wp, lp);
+    auto* m = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
+    if (!m) return CallNextHookEx(nullptr, nCode, wp, lp);
+
+    // 连点计数：**在吞输入判断之前**，且不区分来源。
+    // 本地物理点击与远控注入点击都算 —— 隐私屏关着时也要能靠连点把它打开，
+    // 而那时本地可能没人（纯远程），只认物理点击就永远数不满。
+    if (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN ||
+        wp == WM_MBUTTONDOWN || wp == WM_XBUTTONDOWN) {
+        if (g_owner) g_owner->CountTap(GetTickCount());
+    }
+
+    // 吞输入：只吞物理事件，放行注入事件（远控要能继续操作）。
+    // 注意 LLMHF_LOWER_IL_INJECTED 被置位时 LLMHF_INJECTED 一定同时置位，
+    // 这里一并判断只是让意图更明确。
+    if (g_swallow &&
+        !(m->flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED))) {
+        return 1;
     }
     return CallNextHookEx(nullptr, nCode, wp, lp);
 }
@@ -46,6 +65,39 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wp, LPARAM lp) {
 // ---------------------------------------------------------------------------
 PrivacyScreen::~PrivacyScreen() {
     Stop();
+}
+
+// ---------------------------------------------------------------------------
+void PrivacyScreen::SetNotifyTarget(HWND notifyWnd, UINT notifyMsg) {
+    notifyWnd_ = notifyWnd;
+    notifyMsg_ = notifyMsg;
+}
+
+void PrivacyScreen::ResetTapWindow() {
+    for (int i = 0; i < kTapCount; ++i) tapTimes_[i] = 0;
+    tapHead_ = 0;
+}
+
+// 由鼠标钩子回调转发。必须保持极短：只写数组 + 一次线性扫描（20 项），
+// 不做任何分配、不加锁、不调窗口 API。
+void PrivacyScreen::CountTap(DWORD now) {
+    tapTimes_[tapHead_] = now;
+    tapHead_ = (tapHead_ + 1) % kTapCount;
+
+    // 环形缓冲里可能混着上一次触发前的旧值，所以按时间戳过滤而不是按个数。
+    int inWindow = 0;
+    for (int i = 0; i < kTapCount; ++i) {
+        const DWORD t = tapTimes_[i];
+        // t == 0 是空槽；无符号相减天然免疫 GetTickCount 49.7 天回绕。
+        if (t != 0 && (now - t) <= kTapWindowMs) ++inWindow;
+    }
+    if (inWindow < kTapCount) return;
+
+    ResetTapWindow();
+    // 钩子回调里只投递消息：真正创建/销毁窗口必须在主线程做。
+    if (notifyWnd_ && notifyMsg_) {
+        PostMessageW(notifyWnd_, notifyMsg_, 0, 0);
+    }
 }
 
 bool PrivacyScreen::RegisterWindowClass() {
@@ -143,11 +195,12 @@ bool PrivacyScreen::Start() {
     // 周期置顶：压住后冒出来的任务栏 / 开始菜单 / 弹出菜单（见 privacy.h 第 4 条）
     topmostTimer_ = SetTimer(hwnd_, kTopmostTimerId, kTopmostIntervalMs, nullptr);
 
+    // 钩子只在遮罩期间存在：连点是单向的（只解除），关闭状态下不需要数点击。
     InstallInputHooks();
 
     LogLine("[隐私屏] 已开启：遮罩 " + std::to_string(vw) + "x" + std::to_string(vh) +
             "，捕获排除已生效，本地键鼠" +
-            ((kbHook_ && mouseHook_) ? "已屏蔽" : "屏蔽失败（仍可操作，但看不见）"));
+            ((kbHook_ && mouseHook_) ? "已屏蔽" : "屏蔽不完整（仍可操作，但看不见）"));
     return true;
 }
 
@@ -175,14 +228,18 @@ void PrivacyScreen::Stop() {
 // ---------------------------------------------------------------------------
 void PrivacyScreen::InstallInputHooks() {
     HINSTANCE inst = GetModuleHandleW(nullptr);
+    ResetTapWindow();
+    g_owner = this;
     InterlockedExchange(&g_swallow, 1);
     kbHook_ = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, inst, 0);
     mouseHook_ = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, inst, 0);
     // 钩子回调由安装线程的消息泵派发。托盘的线程本来就在泵消息，所以这里
     // 不需要自己建循环；但**绝不能**在没有消息泵的线程上调用（超时会被系统摘掉）。
-    if (!kbHook_ && !mouseHook_) {
-        InterlockedExchange(&g_swallow, 0);
-        LogLine("[隐私屏] 提示：键鼠钩子安装失败，本地用户仍可操作（但看不见）");
+    if (!kbHook_ || !mouseHook_) {
+        // 只记技术事实，不复述"连点解除"这个彩蛋 —— 日志同样可能被使用者看到。
+        LogLine("[隐私屏] 提示：输入钩子未全部装上（鼠标钩子="
+                + std::string(mouseHook_ ? "OK" : "失败") +
+                "，键盘钩子=" + std::string(kbHook_ ? "OK" : "失败") + "）");
     }
 }
 
@@ -190,6 +247,8 @@ void PrivacyScreen::UninstallInputHooks() {
     InterlockedExchange(&g_swallow, 0);
     if (kbHook_) { UnhookWindowsHookEx(kbHook_); kbHook_ = nullptr; }
     if (mouseHook_) { UnhookWindowsHookEx(mouseHook_); mouseHook_ = nullptr; }
+    g_owner = nullptr;
+    ResetTapWindow();
 }
 
 // ---------------------------------------------------------------------------

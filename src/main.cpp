@@ -735,7 +735,7 @@ int RunTray(Report& r) {
     tray.SetGuardEnabled(r.opt.guard);
     HideConsoleWindow();
 
-    LogLine("ResProbe 托盘已启动。右键托盘图标打开菜单；菜单里的\"退出\"可结束进程。");
+    LogLine("ResProbe 托盘已启动。左键或右键托盘图标都能打开菜单；菜单里的\"退出\"可结束进程。");
     LogLine("托盘与事件监听共用同一个消息循环。");
     if (r.opt.noGuard) {
         LogLine("守卫：已按 --no-guard 关闭，本实例不会自动改动桌面拓扑。");

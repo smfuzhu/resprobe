@@ -55,6 +55,30 @@ public:
     // Start 返回 false 时的人类可读原因
     const std::wstring& LastError() const { return error_; }
 
+    // ---- 连点解除（逃生路径）-----------------------------------------------
+    // 在 10 秒内累计 20 次鼠标按下（任意键）就**解除**隐私屏。
+    //
+    // 单向：只关不开。所以钩子可以只在遮罩期间装 —— 隐私屏没开时不需要数点击，
+    // 也就不必让一个全局鼠标钩子常驻在系统里（少一份侵入、少一份被安全软件盯上的理由）。
+    //
+    // ⚠ 钩子回调由"安装它的线程"（托盘主线程）的消息泵派发。托盘线程若被长时间
+    //   阻塞（不泵消息），超过 LowLevelHooksTimeout(约 300ms) 的事件会被系统直接
+    //   跳过 —— 表现就是连点计数"丢点"。所以托盘线程不能做长时间阻塞操作；
+    //   弹窗之所以安全，是因为 MessageBox 的模态循环本身在泵消息。
+    //
+    // 判定来源：**本地物理点击与远控注入点击都算**。这与"吞输入"的方向相反，
+    // 但两者目的不同 —— 吞输入要放行注入事件好让远控能操作；计数器则要两种来源
+    // 都认，否则在纯远程场合（看不到托盘界面）无法把隐私屏关掉。
+    static constexpr int kTapCount = 20;
+    static constexpr DWORD kTapWindowMs = 10000;
+
+    // 连点达成时 PostMessage 的目标。钩子回调里绝不能直接做窗口操作，
+    // 只能投递消息交给主线程。由托盘在 Create 时设置一次。
+    void SetNotifyTarget(HWND notifyWnd, UINT notifyMsg);
+
+    // 供钩子回调（普通函数）转发调用，不属于对外 API。
+    void CountTap(DWORD now);
+
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     LRESULT OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -62,6 +86,7 @@ private:
     bool RegisterWindowClass();
     void InstallInputHooks();
     void UninstallInputHooks();
+    void ResetTapWindow();
 
     HWND hwnd_ = nullptr;
     HHOOK kbHook_ = nullptr;
@@ -69,6 +94,14 @@ private:
     UINT_PTR topmostTimer_ = 0;
     HBRUSH brush_ = nullptr;
     std::wstring error_;
+
+    // 连点计数的通知目标
+    HWND notifyWnd_ = nullptr;
+    UINT notifyMsg_ = 0;
+    // 环形缓冲：最近 kTapCount 次按下时间戳。0 表示空槽。
+    // 用固定数组而不是 deque，是为了让钩子回调里零堆分配。
+    DWORD tapTimes_[kTapCount] = {};
+    int tapHead_ = 0;
 };
 
 }  // namespace resprobe
