@@ -60,21 +60,13 @@ std::wstring GetHomeDir();
 std::wstring GetOutDirPath();
 bool EnsureOutDir();
 
-// ---------------------------------------------------------------------------
-// 1b) 关闭 / 恢复显示输出（"隐私屏"的底层手段，与具体远控软件无关）
-//
-// 为什么必须是这个 API：隐私屏要求"本地物理屏黑、远程端仍看到正常桌面"，
-// 因此黑必须发生在**扫描输出层**（显示器收不到信号）。若改成在桌面层弹一个
-// 全屏黑窗口，那个窗口是桌面的一部分，会被远控一起捕获，对方也看到黑，
-// 隐私屏就失去意义。SC_MONITORPOWER 就是"关闭显示器"电源选项走的同一条路。
-//
-// 两点必须知道：
-//   * 这是**请求**不是强制 —— 独占全屏应用、投影演示模式等情况下系统会拒绝；
-//   * 关闭后任何键鼠输入都会立刻把屏幕点亮，这是 Windows 行为，无法拦截。
-// 所以返回 true 只说明"请求已投递"，不代表显示器真的灭了。是否生效要靠
-// GUID_CONSOLE_DISPLAY_STATE 电源通知确认（托盘侧见 privacyPending_）。
-bool RequestDisplayOutputOff();
-bool RequestDisplayOutputOn();
+// 注：这里曾经有 RequestDisplayOutputOff/On（用 SC_MONITORPOWER 关闭显示输出），
+// 曾作为"隐私屏"的实现。真机验证后已删除，原因有两条硬事实：
+//   1) rustdesk.exe 持有 DISPLAY 电源请求，会在关屏后不到 1 秒把显示输出要回去，
+//      且没有 API 能释放别的进程的电源请求；
+//   2) 就算关掉了，任何键鼠输入都会立刻点亮 —— 而在 LL 钩子里吞掉物理输入
+//      并不能阻止这一点（实测吞掉 643 个事件后 GetLastInputInfo 仍被钉在 0~109ms）。
+// 隐私屏现在由 src/privacy.cpp 实现（全屏遮罩 + WDA_EXCLUDEFROMCAPTURE）。
 
 // 把本进程的 stdout/stderr 重定向到 <OUT>\<logName>（追加，超过 2MB 则重头写）。
 //

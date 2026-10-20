@@ -24,11 +24,6 @@ const int kIconRedResourceId   = 4;   // resprobe-red.ico    无兜底
 const int kIconYellowResourceId= 5;   // resprobe-yellow.ico 兜底中
 const int kIconPrivacyResourceId = 6; // resprobe-privacy.ico 隐私屏（紫底 + 闭眼横条）
 
-// 隐私屏确认等待：请求关闭显示输出后，最多等这么久收 =OFF 电源通知。
-// 超时即认为系统拒绝了这个请求（独占全屏应用、投影演示模式等）。
-const UINT_PTR kPrivacyTimerId = 3;
-const UINT kPrivacyConfirmMs = 1500;
-
 // 六种形态在托盘提示里的后缀（与图标一一对应，鼠标悬停时给一层文字确认）
 const wchar_t* TrayStateSuffix(TrayIconState s) {
     switch (s) {
@@ -157,17 +152,11 @@ void TrayIcon::Destroy() {
         KillTimer(hwnd_, refreshTimerId_);
         refreshTimerId_ = 0;
     }
-    if (hwnd_ && privacyTimerId_) {
-        KillTimer(hwnd_, privacyTimerId_);
-        privacyTimerId_ = 0;
-    }
-    // 退出前若隐私屏还开着，把显示输出恢复回去。否则用户回来面对的是一片黑，
-    // 且没有任何线索说明是谁干的（隐私意图只在本进程的内存里）。
-    if (privacyArmed_ || privacyPending_) {
-        LogLine("[托盘] 隐私屏 -> 进程退出，恢复显示输出");
-        RequestDisplayOutputOn();
-        privacyArmed_ = false;
-        privacyPending_ = false;
+    // 退出前若隐私屏还开着必须先撤掉遮罩与钩子。否则用户回来面对的是一片黑，
+    // 而且本地键鼠还被吞着，完全没有线索（这些状态只在本进程内存里）。
+    if (privacy_.Active()) {
+        LogLine("[托盘] 隐私屏 -> 进程退出，撤除遮罩并恢复输入");
+        privacy_.Stop();
     }
     RemoveNotificationIcon();
     if (hwnd_) {
@@ -242,13 +231,6 @@ void TrayIcon::RefreshStatusCache(bool force) {
     status_ = QueryTrayStatus(refW_, refH_);
     statusStampMs_ = now;
 
-    // 隐私屏的前提是"有物理屏可遮"。物理屏不在了（EDID 与设备节点都读不到），
-    // 隐私就失去意义，此时解除意图，避免菜单文案与实际情况脱节。
-    // 只解除意图，不擅自发"恢复显示输出"——屏幕本来就是黑的，别去点亮它。
-    if (privacyArmed_ && status_.healthyPhysical <= 0) {
-        CancelPrivacyScreen("物理屏已不在线");
-    }
-
     // 状态刚刷新完，同步一次图标与提示（显示器在线与否只存在于这份探测结果里）
     UpdateTrayIcon();
     RefreshTip();
@@ -285,13 +267,12 @@ TrayIconState DecideTrayIconState(const TrayStatus& st, DisplayPowerState power)
 void TrayIcon::UpdateTrayIcon() {
     if (!iconInstalled_) return;
 
-    // 隐私屏是用户主动发起的覆盖项，但它只在"显示输出确实已关闭"时才显示紫色：
-    // 屏幕被本地输入唤醒后，图标必须回到真实状态（绿/黄/红/蓝），
-    // 否则会出现"屏幕亮着却显示隐私屏中"的谎报。意图本身由菜单文案承载。
+    // 隐私屏是用户主动发起的覆盖项，遮罩存在就显示紫色，压过其余全部状态。
+    // 现在它不再依赖"显示输出是否已关闭"—— 遮罩是否显示完全由我们自己掌控，
+    // 所以图标与实际情况天然一致，不会出现"屏幕亮着却显示隐私屏中"。
     const TrayIconState want =
-        (privacyArmed_ && powerState_ == DisplayPowerState::Off)
-            ? TrayIconState::PrivacyScreen
-            : DecideTrayIconState(status_, powerState_);
+        privacy_.Active() ? TrayIconState::PrivacyScreen
+                          : DecideTrayIconState(status_, powerState_);
 
     if (want == iconState_) return;
 
@@ -332,72 +313,24 @@ void TrayIcon::UpdateTrayIcon() {
 void TrayIcon::TogglePrivacyScreen() {
     if (!iconInstalled_) return;
 
-    if (privacyArmed_ || privacyPending_) {
-        LogLine("[托盘] 隐私屏 -> 关闭（请求恢复显示输出）");
-        // 先解除意图，再发请求。SendMessageTimeout 到 HWND_BROADCAST 是**同步**投递的，
-        // 请求一发出去本窗口就会立刻收到 =ON；若那时意图还在，该通知会被
-        // OnPowerSetting 误记成"本地输入唤醒"，关闭原因就写错了。
-        const bool wasPending = privacyPending_;
-        privacyArmed_ = false;
-        privacyPending_ = false;
-        if (privacyTimerId_) {
-            KillTimer(hwnd_, privacyTimerId_);
-            privacyTimerId_ = 0;
-        }
-        RequestDisplayOutputOn();
-        LogLine(std::string("[托盘] 隐私屏 -> 已关闭") +
-                (wasPending ? "（关闭前请求尚未被确认）" : ""));
+    if (privacy_.Active()) {
+        privacy_.Stop();
+        LogLine("[托盘] 隐私屏 -> 已关闭（遮罩撤除，本地键鼠恢复）");
         UpdateTrayIcon();
         RefreshTip();
         return;
     }
 
-    if (powerState_ == DisplayPowerState::Off) {
-        // 屏幕本来就是黑的（空闲关屏等）：只置意图、不发请求。
-        // 发了也不会产生新的 =OFF 通知，反而会被确认超时误判成"请求被拒"。
-        privacyArmed_ = true;
-        LogLine("[托盘] 隐私屏 -> 开启（当前显示输出本已关闭，直接生效）");
-        UpdateTrayIcon();
+    if (!privacy_.Start()) {
+        // Start 失败时不会留下黑窗口（捕获排除校验不过就直接放弃），
+        // 所以这里可以安全地弹窗告诉用户原因 —— 屏幕还是亮的。
+        LogLine("[托盘] 隐私屏 -> 启动失败: " + W2U8(privacy_.LastError()));
+        Info(L"无法开启隐私屏", privacy_.LastError());
         return;
     }
 
-    // 开启：先置意图（菜单文案立刻变成"关闭隐私屏"），再发请求
-    privacyArmed_ = true;
-    privacyPending_ = true;
-    LogLine("[托盘] 隐私屏 -> 开启（请求关闭显示输出）");
-    RequestDisplayOutputOff();
-
-    // SendMessageTimeout 到 HWND_BROADCAST 是同步投递的：请求返回时 =OFF 通知
-    // 可能已经被 OnPowerSetting 处理掉（那里会把 privacyPending_ 清掉并记"已确认"）。
-    // 所以这里只在"仍在等待"时才补确认或设定时器，避免同一条确认打印两遍。
-    if (privacyPending_ && powerState_ == DisplayPowerState::Off) {
-        privacyPending_ = false;
-        LogLine("[托盘] 隐私屏 -> 已确认（显示输出已关闭）");
-    } else if (privacyPending_) {
-        // 继续等电源通知；超时说明系统拒绝了这个请求
-        privacyTimerId_ = SetTimer(hwnd_, kPrivacyTimerId, kPrivacyConfirmMs, nullptr);
-    }
-
-    UpdateTrayIcon();
-}
-
-void TrayIcon::CancelPrivacyScreen(const char* reason) {
-    privacyArmed_ = false;
-    privacyPending_ = false;
-    if (privacyTimerId_) {
-        KillTimer(hwnd_, privacyTimerId_);
-        privacyTimerId_ = 0;
-    }
-    LogLine(std::string("[托盘] 隐私屏 -> 取消（") + reason + "）");
     UpdateTrayIcon();
     RefreshTip();
-}
-
-void TrayIcon::OnPrivacyConfirmTimeout() {
-    if (!privacyPending_) return;
-    // 1.5 秒内没收到 =OFF：系统拒绝了这个请求。独占全屏应用、投影演示模式、
-    // 以及某些电源策略都会导致这种情况。
-    CancelPrivacyScreen("请求未生效，系统未确认关闭显示输出");
 }
 
 // ---------------------------------------------------------------------------
@@ -428,24 +361,10 @@ void TrayIcon::OnPowerSetting(WPARAM, LPARAM lp) {
 
     LogLine("[托盘] 电源通知(显示器状态)=" + W2U8(DisplayPowerStateName(powerState_)));
 
-    if (powerState_ == DisplayPowerState::Off) {
-        if (privacyPending_) {
-            // 我们发起的请求被接受了
-            privacyPending_ = false;
-            if (privacyTimerId_) {
-                KillTimer(hwnd_, privacyTimerId_);
-                privacyTimerId_ = 0;
-            }
-            LogLine("[托盘] 隐私屏 -> 已确认（收到电源通知 =OFF）");
-        }
-    } else if (privacyArmed_) {
-        // 显示输出又亮了（=On 或 =Dimmed）。两种可能：本地键鼠输入唤醒，或者
-        // 某个进程持着显示电源请求把屏幕要了回去（RustDesk 就会这么干，
-        // 见 powercfg /requests）——这两者从通知里分不出来，所以措辞保持中立。
-        // 按既定策略"接受该限制"，隐私屏视为一次性结束；只解除意图，不发"恢复
-        // 显示输出"（屏幕已经亮了，发了也是空操作）。
-        CancelPrivacyScreen("显示输出已恢复（本地输入唤醒，或被电源请求要回）");
-    }
+    // 注意：隐私屏不再依赖这个通知。
+    // 早先的实现用 SC_MONITORPOWER 关闭显示输出来做隐私屏，必须靠 =OFF/=ON 确认
+    // 与收尾；但 RustDesk 持有 DISPLAY 电源请求会立刻把输出要回去，那条路已废弃。
+    // 现在隐私屏是全屏遮罩 + 捕获排除，遮罩在不在完全由我们自己掌控。
 
     // 事件驱动，无需等定时器：这里直接重判一次图标
     UpdateTrayIcon();
@@ -523,11 +442,6 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RefreshStatusCache(true);
                 return 0;
             }
-            if (wp == kPrivacyTimerId) {
-                privacyTimerId_ = 0;
-                OnPrivacyConfirmTimeout();
-                return 0;
-            }
             break;
 
         case WM_CLOSE:
@@ -594,11 +508,9 @@ void TrayIcon::ShowContextMenu() {
     AppendMenuW(menu, MF_STRING, kIdPaths, L"列出显示输出路径...");
 
     // ---- 隐私屏 -------------------------------------------------------------
-    // 文案跟随"意图"而不是"屏幕当前是否真黑"：屏幕被本地输入唤醒后意图仍在，
-    // 此时点它才是"关闭隐私屏"；否则永远只能开启，无法用菜单收尾。
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kIdPrivacy,
-                (privacyArmed_ || privacyPending_) ? L"关闭隐私屏" : L"开启隐私屏");
+                privacy_.Active() ? L"关闭隐私屏" : L"开启隐私屏");
 
     // ---- 分辨率 -------------------------------------------------------------
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);

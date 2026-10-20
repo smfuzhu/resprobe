@@ -14,6 +14,7 @@
 
 #include "actions.h"
 #include "common.h"
+#include "privacy.h"
 
 #include <shellapi.h>
 
@@ -92,16 +93,9 @@ private:
     // 文本没变就不发 NIM_MODIFY。
     void RefreshTip();
 
-    // ---- 隐私屏（工具无关：本地物理屏黑，远程端仍看到桌面）------------------
-    // 菜单开关。开启时请求关闭显示输出，并等电源通知确认；关闭时请求恢复。
+    // ---- 隐私屏（工具无关：本地黑屏且动不了，远程端仍看到桌面并能操作）------
+    // 菜单开关。实际实现委托给 PrivacyScreen（全屏遮罩 + 捕获排除 + 吞物理键鼠）。
     void TogglePrivacyScreen();
-
-    // 解除隐私意图并记原因。只改标志与图标，不擅自发"恢复显示输出"消息
-    // （避免把用户故意黑着的屏幕点亮）；唯一例外是进程退出前的兜底恢复。
-    void CancelPrivacyScreen(const char* reason);
-
-    // 隐私屏确认超时：请求发出后 1.5 秒内没收到 =OFF，视为系统拒绝。
-    void OnPrivacyConfirmTimeout();
 
     // GUID_CONSOLE_DISPLAY_STATE 通知：WM_POWERBROADCAST / PBT_POWERSETTINGCHANGE
     void OnPowerSetting(WPARAM wp, LPARAM lp);
@@ -139,11 +133,9 @@ private:
     DisplayPowerState powerState_ = DisplayPowerState::Unknown;
     TrayIconState iconState_ = TrayIconState::Default;
     UINT_PTR refreshTimerId_ = 0;
-    UINT_PTR privacyTimerId_ = 0;   // 隐私屏确认超时（一次性）
-    // 隐私屏意图标志（菜单开关的语义）。它独立于"屏幕当前是否真黑"：
-    // 图标只在 armed 且显示输出确实关闭时才显示紫色，其余情况图标反映真实状态。
-    bool privacyArmed_ = false;
-    bool privacyPending_ = false;   // 已发出请求，正在等 =OFF 确认
+    // 隐私屏实体（全屏遮罩窗口 + 键鼠钩子）。它的 Active() 同时就是菜单文案
+    // 与第 6 态图标的唯一依据 —— 不再有"意图标志 / 实际状态"两套状态。
+    PrivacyScreen privacy_;
     bool iconInstalled_ = false;
     UINT taskbarCreatedMsg_ = 0;
     NOTIFYICONDATAW nid_{};
