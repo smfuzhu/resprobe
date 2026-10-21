@@ -131,6 +131,12 @@ private:
 
     void Info(const std::wstring& title, const std::wstring& text);
 
+    // 非阻塞通知（托盘气球）。隐私屏开启/关闭的确认一律走这里，不用模态弹窗：
+    // 模态框会无期限扣押托盘线程，且开启确认框会出现在全屏遮罩之上、却因钩子
+    // 吞掉物理点击而点不掉（2026-10-21 真机实证，详见 TogglePrivacyScreen）。
+    // 被系统策略静默时不算失败：图标与提示的变化仍是有效反馈。
+    void ShowBalloon(const std::wstring& title, const std::wstring& text);
+
     HWND hwnd_ = nullptr;
     HINSTANCE inst_ = nullptr;
     HICON icon_ = nullptr;          // 默认（resprobe.rc ID 1）

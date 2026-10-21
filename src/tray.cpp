@@ -338,9 +338,11 @@ void TrayIcon::TogglePrivacyScreen() {
         LogLine("[托盘] 隐私屏 -> 已关闭（遮罩撤除，本地键鼠恢复）");
         UpdateTrayIcon();
         RefreshTip();
-        // 解除也要确认。此时遮罩已经撤掉，所以这个弹窗本地和远端都看得见。
-        Info(L"隐私屏已关闭",
-             L"本地屏幕已恢复，本地键鼠已恢复正常操作。");
+        // 关闭确认同样用气球。此时遮罩已撤、输入已恢复，模态框本身不是死结，
+        // 但"托盘线程零阻塞"是隐私屏在位期间的硬规则，不分开关方向 ——
+        // 而且气球本地/远端都看得见，满足"解除时双向可见"的需求。
+        ShowBalloon(L"隐私屏已关闭",
+                    L"本地屏幕已恢复，本地键鼠已恢复正常操作。");
         return;
     }
 
@@ -355,19 +357,27 @@ void TrayIcon::TogglePrivacyScreen() {
     UpdateTrayIcon();
     RefreshTip();
 
-    // 开启成功后的确认弹窗（关闭不弹，按需求）。
+    // 开启确认用托盘气球，**不能用模态弹窗**（2026-10-21 真机踩坑，两条都中过）：
     //
-    // 这个窗口是普通非置顶窗口，会被我们自己的全屏遮罩盖住 —— 于是：
-    //   * 本地看不到它（也就不会出现"本地有个点不掉的对话框"这种死结）；
-    //   * 捕获端看不到遮罩，所以远端能正常看到并点掉它。
-    // 换句话说它是给发起操作的那一端（通常是远端）看的确认。
-    // 弹窗是模态的，消息泵仍在跑，100ms 置顶定时器与连点切换都不受影响。
-    // 注意：这里只列托盘菜单一条关闭途径。连点解除是**彩蛋**，不能在界面文案里
-    // 提示出来 —— 否则等于把"本地任何人都能解除隐私屏"的方法直接告诉使用者。
-    Info(L"隐私屏已开启",
-         L"本地屏幕已变黑，本地键鼠已屏蔽；\n"
-         L"远程端仍可正常看到并操作桌面。\n\n"
-         L"如需关闭，请使用托盘菜单「关闭隐私屏」。");
+    //   1) 模态弹窗无期限扣押托盘线程：消息泵困在 MessageBox 里，本地发起的一切
+    //      同步动作全部挂起，且没有超时 —— 没人点掉就一直卡（实证：卡住数小时，
+    //      最后靠 20 连点逃生，OUT\tray.log 里"已开启"与"连点解除触发"隔着整段）。
+    //   2) 开启确认框"本地看得见却点不动"：它在 Start() 之后弹，钩子已经在吞
+    //      物理点击；而 Info() 用 owner=nullptr + MB_SETFOREGROUND 追求的正是
+    //      "不被其它窗口挡住"的顶层对话框，它会出现在 WS_EX_TOPMOST 遮罩**之上**
+    //      —— 并非早先注释假设的"被遮罩盖住、本地看不到"。于是本地看到一个
+    //      点不掉的框，与"开启时本地看不到"的设计意图直接冲突，只有远控注入
+    //      点击或 20 连点能解，这正是要避免的死结。
+    //
+    // 气球两个问题都没有：不阻塞线程、不需要点击、自动消失；远端照样可见
+    // （explorer 的 UI 正常被捕获）。被系统策略静默时也有图标变紫 + 提示变更
+    // + 日志三重兜底，确认信息不丢。
+    // 文案里只列托盘菜单一条关闭途径：连点解除是**彩蛋**，不能在界面里提示 ——
+    // 否则等于把"本地任何人都能解除隐私屏"的方法直接告诉使用者。
+    ShowBalloon(L"隐私屏已开启",
+                L"本地屏幕已变黑，本地键鼠已屏蔽；\n"
+                L"远程端仍可正常看到并操作桌面。\n\n"
+                L"如需关闭，请使用托盘菜单「关闭隐私屏」。");
 }
 
 // ---------------------------------------------------------------------------
@@ -671,11 +681,15 @@ void TrayIcon::ShowContextMenu() {
     }
 
     // ---- 虚拟显示器 ---------------------------------------------------------
+    // 隐私屏在位时置灰脚本类动作：它们同步等待脚本进程（超时 5 分钟），会停掉
+    // 遮罩的 100ms 重抢并触发 LL 钩子超时丢点，等于在隐私屏上开窗（privacy.h）。
+    // 置灰只是体验层，真正的拦截在 ActRunScriptAction 里（防其它入口）。
     {
+        const UINT scriptFlags = privacy_.Active() ? (MF_STRING | MF_GRAYED) : MF_STRING;
         HMENU vd = CreatePopupMenu();
-        AppendMenuW(vd, MF_STRING, kIdInstall, L"安装 / 修复");
-        AppendMenuW(vd, MF_STRING, kIdUninstall, L"卸载（保留驱动）");
-        AppendMenuW(vd, MF_STRING, kIdUninstallFull, L"彻底卸载（移除驱动）");
+        AppendMenuW(vd, scriptFlags, kIdInstall, L"安装 / 修复");
+        AppendMenuW(vd, scriptFlags, kIdUninstall, L"卸载（保留驱动）");
+        AppendMenuW(vd, scriptFlags, kIdUninstallFull, L"彻底卸载（移除驱动）");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)vd, L"虚拟显示器");
     }
 
@@ -941,6 +955,19 @@ void TrayIcon::ActRunScriptAction(const std::wstring& role, const std::wstring& 
                                   const std::wstring& successText) {
     if (busy_) return;
 
+    // 隐私屏在位期间拒绝执行脚本类动作：RunProjectScript 同步等待最长 5 分钟，
+    // 期间托盘线程不泵消息 —— 遮罩的 100ms 重抢会停（任务栏等可趁虚覆盖遮罩，
+    // 隐私出现窗口期），LL 钩子事件也会因 LowLevelHooksTimeout(约 300ms) 被
+    // 系统跳过（privacy.h「连点解除」段落的 ⚠ 注释）。菜单里已置灰，这里再拦
+    // 一道防其它入口，并用气球说清原因（同样不能弹模态框）。
+    if (privacy_.Active()) {
+        LogLine("[托盘] 已拒绝执行脚本动作（隐私屏开启中）：" + W2U8(title));
+        ShowBalloon(L"隐私屏开启中，已拒绝执行",
+                    L"「" + title + L"」需要长时间同步等待，会影响隐私屏遮罩。\n"
+                    L"请先关闭隐私屏，再执行该操作。");
+        return;
+    }
+
     const int ans = MessageBoxW(
         nullptr,
         (L"即将执行：" + title +
@@ -1019,6 +1046,24 @@ void TrayIcon::Info(const std::wstring& title, const std::wstring& text) {
     // 并显式要求置前台，否则可能被其它窗口挡住。
     MessageBoxW(nullptr, text.c_str(), title.c_str(),
                 MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+}
+
+void TrayIcon::ShowBalloon(const std::wstring& title, const std::wstring& text) {
+    if (!iconInstalled_) return;
+
+    // 刻意不调用 NIM_SETVERSION（见 AddNotificationIcon）：保持旧版回调语义。
+    // 旧版气球按 uTimeout 显示后自动消失，不需要用户点击 —— 这正是选它而不选
+    // 模态弹窗的原因：托盘线程不会被扣押，也不存在"看得见点不掉"的死结。
+    // 旧版语义下 uTimeout 会被钳制在 [10s, 30s]。
+    nid_.uFlags = NIF_INFO;
+    nid_.dwInfoFlags = NIIF_INFO;
+    nid_.uTimeout = 10000;
+    wcsncpy_s(nid_.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(nid_.szInfo, text.c_str(), _TRUNCATE);
+    if (!Shell_NotifyIconW(NIM_MODIFY, &nid_)) {
+        // 气球被系统策略禁用时不算失败：图标与提示已经变化，确认信息不丢
+        LogLine("[托盘] 气球通知未能显示（可能被系统策略禁用），仅图标与提示变化");
+    }
 }
 
 }  // namespace resprobe
