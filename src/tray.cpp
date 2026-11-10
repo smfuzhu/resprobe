@@ -49,6 +49,13 @@ const wchar_t* TrayStateSuffix(TrayIconState s) {
 const UINT_PTR kTrayRefreshTimerId = 2;
 const UINT kTrayRefreshIntervalMs = 5000;
 
+// 「显示器关闭后自动进入隐私屏」的延时定时器（一次性）。
+// 30 秒不只是防抖：物理屏掉线后守卫会在数秒内把虚拟屏提成主屏，遮罩必须等
+// 拓扑稳定、按最终虚拟桌面尺寸创建，否则会盖错范围（见 privacy.cpp 的
+// WM_DISPLAYCHANGE 重新铺满逻辑，那是兜底不是首选）。
+const UINT_PTR kAutoPrivacyTimerId = 3;
+const UINT kAutoPrivacyDelayMs = 30000;
+
 // 菜单命令 ID
 enum MenuId : int {
     kIdStatus        = 1001,
@@ -66,6 +73,7 @@ enum MenuId : int {
     kIdAutoOff       = 1303,
     kIdAutoStatus    = 1304,
     kIdPrivacy       = 1305,
+    kIdAutoPrivacy   = 1306,
 
     kIdInstall       = 1401,
     kIdUninstall     = 1402,
@@ -172,6 +180,7 @@ void TrayIcon::Destroy() {
         KillTimer(hwnd_, refreshTimerId_);
         refreshTimerId_ = 0;
     }
+    CancelAutoPrivacyTimer();
     // 退出前若隐私屏还开着必须先撤掉遮罩与钩子。否则用户回来面对的是一片黑，
     // 而且本地键鼠还被吞着，完全没有线索（这些状态只在本进程内存里）。
     if (privacy_.Active()) {
@@ -254,6 +263,157 @@ void TrayIcon::RefreshStatusCache(bool force) {
     // 状态刚刷新完，同步一次图标与提示（显示器在线与否只存在于这份探测结果里）
     UpdateTrayIcon();
     RefreshTip();
+
+    // 物理屏在线→离线的边沿只存在于周期性探测里（EDID 无事件通知）。
+    // 电源通知 OnPowerSetting 走的是另一条信号（Windows 关显示输出），不在这里判。
+    EvaluateAutoPrivacyEdge();
+}
+
+// ---------------------------------------------------------------------------
+// 显示器关闭后自动进入隐私屏
+// ---------------------------------------------------------------------------
+void TrayIcon::CancelAutoPrivacyTimer() {
+    if (autoPrivacyTimerId_ && hwnd_) {
+        KillTimer(hwnd_, autoPrivacyTimerId_);
+    }
+    autoPrivacyTimerId_ = 0;
+}
+
+void TrayIcon::EnterAutoPrivacyPending(const char* reason) {
+    if (!autoPrivacyEnabled_ || privacy_.Active()) return;
+    if (autoPhase_ == AutoPrivacyPhase::Suppressed) return;
+
+    CancelAutoPrivacyTimer();
+    autoPrivacyTimerId_ = SetTimer(hwnd_, kAutoPrivacyTimerId,
+                                   kAutoPrivacyDelayMs, nullptr);
+    if (!autoPrivacyTimerId_) {
+        LogLine("[自动隐私屏] 延时定时器创建失败，本次不自动开启");
+        autoPhase_ = AutoPrivacyPhase::Idle;
+        return;
+    }
+    autoPhase_ = AutoPrivacyPhase::Pending;
+    LogLine(std::string("[自动隐私屏] ") + reason +
+            "：已排队，" + std::to_string(kAutoPrivacyDelayMs / 1000) +
+            " 秒后自动进入隐私屏");
+}
+
+// 只在 RefreshStatusCache 里被调用。核心是**边沿**而不是"离线"这个电平：
+// 显示器关着是持续状态，按电平判断会在用户手动关闭隐私屏后又立刻重开。
+void TrayIcon::EvaluateAutoPrivacyEdge() {
+    const int now = status_.healthyPhysical;
+
+    if (!autoBaselineReady_) {
+        // 启动时只建立基线。若显示器本来就关着，不补触发 ——
+        // 否则程序一重启就突然黑屏，用户完全不知道发生了什么。
+        autoBaselineReady_ = true;
+        lastHealthyPhysical_ = now;
+        return;
+    }
+    if (now == lastHealthyPhysical_) {
+        return;   // 快路径：绝大多数 5 秒轮询都走这里
+    }
+
+    const bool wasOnline = lastHealthyPhysical_ > 0;
+    const bool isOnline = now > 0;
+    lastHealthyPhysical_ = now;
+
+    // 重新在线：结束本周期，解除抑制、取消待触发，为下一次边沿重新武装。
+    // 注意 Suspended（被系统撤罩待恢复）也在这里归零 —— 显示器都开了，
+    // 恢复后自然不需要再自动进隐私屏。
+    if (isOnline) {
+        if (autoPhase_ != AutoPrivacyPhase::Idle) {
+            LogLine("[自动隐私屏] 物理屏已恢复在线，本周期结束");
+        }
+        CancelAutoPrivacyTimer();
+        autoPhase_ = AutoPrivacyPhase::Idle;
+        return;
+    }
+
+    // 在线→离线边沿。要求 primaryMode 非空且仍有活动输出，把"一次瞬时
+    // 枚举失败 / 所有输出都消失"排除掉（与 DecideTrayIconState 的防御同源）。
+    if (!wasOnline) return;
+    if (status_.primaryMode.empty() || status_.totalActive <= 0) {
+        LogLine("[自动隐私屏] 忽略一次疑似探测失败的离线边沿");
+        return;
+    }
+    if (autoPhase_ != AutoPrivacyPhase::Idle) return;   // 本周期已处理过
+    EnterAutoPrivacyPending("物理屏掉线边沿");
+}
+
+void TrayIcon::OnAutoPrivacyTimer() {
+    CancelAutoPrivacyTimer();
+    if (autoPhase_ != AutoPrivacyPhase::Pending) return;
+    if (!autoPrivacyEnabled_) {
+        autoPhase_ = AutoPrivacyPhase::Idle;
+        return;
+    }
+
+    // 到期时重新取一次真实状态：这 30 秒里守卫改过拓扑、显示器也可能已经回来。
+    RefreshStatusCache(true);
+    // RefreshStatusCache 内部会跑边沿检测。若恰好又排了一个新的延时（显示器
+    // 在这 30 秒里来回抖动），交给新定时器处理，本次直接退出，避免重复开启。
+    if (autoPrivacyTimerId_ != 0) return;
+    if (privacy_.Active() || status_.healthyPhysical > 0 ||
+        status_.primaryMode.empty() || status_.totalActive <= 0) {
+        LogLine("[自动隐私屏] 延时到期但条件已不成立，取消本次开启");
+        autoPhase_ = AutoPrivacyPhase::Idle;
+        return;
+    }
+
+    if (StartPrivacySilently("物理屏持续离线")) {
+        autoPhase_ = AutoPrivacyPhase::Active;
+    } else {
+        // 启动失败多半是环境不支持 WDA_EXCLUDEFROMCAPTURE。不重试 ——
+        // 本周期没有新的边沿可等，反复重试只会刷日志。
+        autoPhase_ = AutoPrivacyPhase::Suppressed;
+    }
+}
+
+// 自动路径专用的静默开启。与 TogglePrivacyScreen 的区别：
+//   * 失败**绝不弹模态框**（屏幕关着没人点，会无期限扣押托盘线程）；
+//   * 成功也不弹确认框，只写日志 + 更新图标/提示。
+bool TrayIcon::StartPrivacySilently(const char* reason) {
+    if (privacy_.Active()) return true;
+    if (!privacy_.Start()) {
+        LogLine(std::string("[自动隐私屏] ") + reason + " 启动失败：" +
+                W2U8(privacy_.LastError()));
+        ShowBalloon(L"自动隐私屏未开启",
+                    L"屏幕未受影响。原因：" + privacy_.LastError());
+        return false;
+    }
+    UpdateTrayIcon();
+    RefreshTip();
+    LogLine(std::string("[自动隐私屏] ") + reason +
+            "：隐私屏已开启（本地黑屏，远端仍可见可操作）");
+    return true;
+}
+
+// 用户手动开关隐私屏时调用，用于抑制本周期的自动重开。
+void TrayIcon::NoteManualPrivacyToggle(bool nowActive) {
+    if (nowActive) {
+        // 手动开启：取消待触发的自动计时，本周期交给用户自己管。
+        if (autoPhase_ == AutoPrivacyPhase::Pending) {
+            CancelAutoPrivacyTimer();
+            autoPhase_ = AutoPrivacyPhase::Idle;
+        }
+        return;
+    }
+    // 手动关闭：只有当隐私屏是自动模式开的（或被系统撤除过、正在等恢复）时
+    // 才需要抑制。手动开的隐私屏与自动逻辑无关，不动 autoPhase_。
+    if (autoPhase_ == AutoPrivacyPhase::Active ||
+        autoPhase_ == AutoPrivacyPhase::Suspended) {
+        autoPhase_ = AutoPrivacyPhase::Suppressed;
+        CancelAutoPrivacyTimer();
+        LogLine("[自动隐私屏] 用户已手动解除，本周期不再自动开启");
+    }
+}
+
+// 系统从睡眠 / 锁屏恢复后按条件重新自动进入（不豁免兜底，只是恢复意图）。
+void TrayIcon::MaybeResumeAutoPrivacy(const char* reason) {
+    if (!autoPrivacyEnabled_) return;
+    if (autoPhase_ != AutoPrivacyPhase::Suspended) return;
+    if (privacy_.Active()) return;
+    EnterAutoPrivacyPending(reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +498,9 @@ void TrayIcon::TogglePrivacyScreen() {
         LogLine("[托盘] 隐私屏 -> 已关闭（遮罩撤除，本地键鼠恢复）");
         UpdateTrayIcon();
         RefreshTip();
+        // 手动解除（含连点彩蛋）要抑制本周期的自动重开，否则"显示器还关着"
+        // 这个持续成立的电平会把隐私屏立刻再打开，形成关不掉的死循环。
+        NoteManualPrivacyToggle(false);
         // 关闭确认同样用气球。此时遮罩已撤、输入已恢复，模态框本身不是死结，
         // 但"托盘线程零阻塞"是隐私屏在位期间的硬规则，不分开关方向 ——
         // 而且气球本地/远端都看得见，满足"解除时双向可见"的需求。
@@ -356,6 +519,7 @@ void TrayIcon::TogglePrivacyScreen() {
 
     UpdateTrayIcon();
     RefreshTip();
+    NoteManualPrivacyToggle(true);
 
     // 开启确认用托盘气球，**不能用模态弹窗**（2026-10-21 真机踩坑，两条都中过）：
     //
@@ -401,9 +565,15 @@ void TrayIcon::TogglePrivacyScreen() {
 //      不重判会留下"屏幕亮着却显示隐私屏中"的谎报。
 void TrayIcon::StopPrivacyForLifecycle(const char* reason) {
     if (!privacy_.Active()) return;
+    const bool wasAuto = (autoPhase_ == AutoPrivacyPhase::Active);
     privacy_.Stop();
     LogLine(std::string("[隐私屏] 已自动撤除（") + reason +
-            "）：遮罩移除，本地键鼠恢复；不会自动重新开启");
+            "）：遮罩移除，本地键鼠恢复；" +
+            (wasAuto ? "自动模式将在系统恢复后按条件重新进入"
+                     : "不会自动重新开启"));
+    // 手动开启的隐私屏仍严格遵守「只撤除，不恢复」。只有自动模式开的才转入
+    // Suspended 等待恢复 —— 这是用户拍板的"不豁免兜底，但恢复后按条件重进"。
+    if (wasAuto) autoPhase_ = AutoPrivacyPhase::Suspended;
     UpdateTrayIcon();
     RefreshTip();
 }
@@ -521,9 +691,11 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return TRUE;   // 必须回 TRUE，系统才会在恢复时发 PBT_APMRESUMESUSPEND
             }
             if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
-                // 恢复后不重开隐私屏（见 StopPrivacyForLifecycle 的语义约束 1），
-                // 但拓扑与电源状态大概率已经变了，强制重判一次图标。
+                // 手动开启的隐私屏：只撤不恢复（StopPrivacyForLifecycle 语义）。
+                // 自动模式开的：兜底照撤，但恢复后按条件重新走延时进入。
+                // 拓扑与电源状态大概率已变，先强制重判一次状态/图标。
                 RefreshStatusCache(true);
+                MaybeResumeAutoPrivacy("系统从睡眠恢复");
                 return TRUE;
             }
             break;
@@ -540,8 +712,10 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     StopPrivacyForLifecycle("会话注销");
                     return 0;
                 case WTS_SESSION_UNLOCK:
-                    // 解锁后不重开，但屏幕刚恢复，缓存的状态多半已过期
+                    // 解锁后缓存的状态多半已过期；自动模式若被锁屏兜底撤过罩，
+                    // 在这里按条件重新排队进入（同样要等 30 秒让拓扑稳定）。
                     RefreshStatusCache(true);
+                    MaybeResumeAutoPrivacy("会话解锁");
                     return 0;
                 default:
                     // 远程连接/断开等：隐私屏不关心，交给 watcher 记录
@@ -562,6 +736,10 @@ LRESULT TrayIcon::OnMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == kTrayRefreshTimerId) {
                 // 显示器在线与否没有事件通知，只能靠周期探测
                 RefreshStatusCache(true);
+                return 0;
+            }
+            if (wp == kAutoPrivacyTimerId) {
+                OnAutoPrivacyTimer();
                 return 0;
             }
             break;
@@ -636,6 +814,8 @@ void TrayIcon::ShowContextMenu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kIdPrivacy,
                 privacy_.Active() ? L"关闭隐私屏" : L"开启隐私屏");
+    AppendMenuW(menu, MF_STRING | (autoPrivacyEnabled_ ? MF_CHECKED : 0),
+                kIdAutoPrivacy, L"显示器关闭后自动进入隐私屏");
 
     // ---- 分辨率 -------------------------------------------------------------
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -736,6 +916,21 @@ bool TrayIcon::HandleCommand(int id) {
             return true;
         case kIdPrivacy:
             TogglePrivacyScreen();
+            return true;
+        case kIdAutoPrivacy:
+            autoPrivacyEnabled_ = !autoPrivacyEnabled_;
+            if (!autoPrivacyEnabled_) {
+                // 只停掉"未来的自动触发"。已经开着的隐私屏不擅自撤 —— 那会
+                // 在用户只是想关掉自动化时突然把屏幕亮出来，更意外。
+                CancelAutoPrivacyTimer();
+                if (autoPhase_ == AutoPrivacyPhase::Pending ||
+                    autoPhase_ == AutoPrivacyPhase::Suspended) {
+                    autoPhase_ = AutoPrivacyPhase::Idle;
+                }
+                LogLine("[自动隐私屏] 已停用（已开启的隐私屏不受影响，可手动关闭）");
+            } else {
+                LogLine("[自动隐私屏] 已启用（等待下一次物理屏掉线边沿）");
+            }
             return true;
         case kIdOpenOut:
             // ShellExecute 会失败（资源管理器被替换、路径不存在、被策略拦截），

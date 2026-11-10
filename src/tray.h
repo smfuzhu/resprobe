@@ -20,6 +20,31 @@
 
 namespace resprobe {
 
+// 「显示器关闭后自动进入隐私屏」的一次"在线→离线"周期内的相位。
+//
+// 单向、一次性：一次离线周期最多自动触发一次。这样用户手动关闭隐私屏后
+// 不会被下一轮探测重新打开（自动条件"显示器关着"是持续成立的电平，
+// 若按电平判断就会形成关不掉的死循环）。
+//
+//   Idle ──(在线→离线边沿)──> Pending ──(30 秒到、条件仍成立)──> Active
+//     ^                          │                                 │
+//     │                     (显示器回来)                    (锁屏/睡眠撤罩)
+//     │                          │                                 ↓
+//     │                          └──────────────────────────> Suspended
+//     │                                                           │
+//     │                                              (恢复 + 条件仍成立)
+//     │                                                           ↓
+//     │                                                        Pending
+//     │
+//   Idle <──(重新检测到在线)── Suppressed <──(用户手动解除自动开的隐私屏)
+enum class AutoPrivacyPhase {
+    Idle,        // 显示器在线，等待下一个"在线→离线"边沿
+    Pending,     // 检测到离线边沿，30 秒延时中
+    Active,      // 隐私屏由自动模式开启且仍在位
+    Suspended,   // 被锁屏/睡眠兜底撤除，等系统恢复后按条件重进
+    Suppressed,  // 用户手动解除过，本周期不再自动开，直到显示器重新在线
+};
+
 // 托盘图标的六种形态，资源 ID 见 res/resprobe.rc
 // （1=默认, 2=绿, 3=蓝, 4=红, 5=黄, 6=紫底横条）。
 //
@@ -96,6 +121,21 @@ private:
     // ---- 隐私屏（工具无关：本地黑屏且动不了，远程端仍看到桌面并能操作）------
     // 菜单开关。实际实现委托给 PrivacyScreen（全屏遮罩 + 捕获排除 + 吞物理键鼠）。
     void TogglePrivacyScreen();
+
+    // ---- 显示器关闭后自动进入隐私屏 ----------------------------------------
+    // 触发信号是"物理屏掉线"的**下降沿**（healthyPhysical 由 >0 变 0，且仍
+    // 有活动输出排除探测失败），不是 Windows 关闭显示输出（后者紧接着就锁屏，
+    // 会被 StopPrivacyForLifecycle 撤掉）。详见 AutoPrivacyPhase。
+    //
+    // 静默路径：自动触发时屏幕关着没人看，绝不能弹模态框（会无期限扣押托盘
+    // 线程，2026-10-21 真机踩过）。失败只写日志，成功也只写日志 + 图标/提示。
+    void OnAutoPrivacyTimer();
+    void EnterAutoPrivacyPending(const char* reason);
+    void CancelAutoPrivacyTimer();
+    bool StartPrivacySilently(const char* reason);
+    void NoteManualPrivacyToggle(bool nowActive);
+    void MaybeResumeAutoPrivacy(const char* reason);
+    void EvaluateAutoPrivacyEdge();
 
     // 隐私屏的"生命周期兜底"：会话锁定 / 系统休眠 / 注销时**主动撤除**遮罩。
     //
@@ -176,6 +216,15 @@ private:
 
     // 本实例是否承担守卫（由启动方设置）
     bool guardEnabled_ = false;
+
+    // ---- 自动隐私屏状态 ----------------------------------------------------
+    bool autoPrivacyEnabled_ = true;         // 菜单可勾选，默认启用
+    AutoPrivacyPhase autoPhase_ = AutoPrivacyPhase::Idle;
+    UINT_PTR autoPrivacyTimerId_ = 0;
+    // 边沿检测基线。-1 = 尚未建立：启动时只记基线，不对"显示器本来就关着"
+    // 的情况补触发（否则程序一重启就突然黑屏）。
+    int lastHealthyPhysical_ = -1;
+    bool autoBaselineReady_ = false;
 };
 
 }  // namespace resprobe
